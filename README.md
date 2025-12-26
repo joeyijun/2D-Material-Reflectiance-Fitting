@@ -48,8 +48,8 @@
 
 ### 方式一：Web 版 (推荐)
 **无需安装任何 Python 环境**。
-1.  直接用浏览器（Chrome/Edge）打开项目根目录下的 `index.html` 文件。
-2.  等待加载完成后即可使用。
+1.  **在线访问**: 点击 [https://reflectiance.streamlit.app/](https://reflectiance.streamlit.app/) 直接使用。
+2.  **或者本地运行**: 直接用浏览器（Chrome/Edge）打开项目根目录下的 `index.html` 文件。
 
 ### 方式二：桌面版 (PyQt6)
 适合开发人员或需要本地高性能计算的用户。
@@ -73,7 +73,11 @@
 
 ### 2. 载入与设置
 1.  **Upload Files**: 分别上传衬底和样品光谱文件。程序会自动计算实验对比度：
-    $$ C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}} $$
+    
+    $$
+    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}}
+    $$
+    
 2.  **Structure Config**: 设置实验样品的物理结构（如 SiO2 厚度 285nm，是否覆盖 hBN 等）。
 3.  **Material Data**: 默认使用内置的 Si (n,k) 数据。如有特殊需求，可上传自定义的 Si 折射率文件。
 
