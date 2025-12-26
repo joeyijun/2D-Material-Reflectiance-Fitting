@@ -24,7 +24,10 @@
     *   2D Material: 单层或少层样品。
 *   **温度相关性**: 内置 Si 折射率的温度修正模型 (10K - 300K)，适用于低温光谱拟合。
 *   **Lorentz 介电函数**: 使用经典洛伦兹振子模型描述激子吸收：
-    $$ \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j} $$
+    
+    $$
+    \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
+    $$
 
 ### 3. 先进的拟合算法
 *   **多种拟合策略**:
