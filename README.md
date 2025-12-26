@@ -101,6 +101,17 @@
 ---
 
 ## 物理原理简述
+
+### 光学对比度
+对比度定义为：
+$$ C(\lambda) = \frac{R_{sample}(\lambda) - R_{substrate}(\lambda)}{R_{sample}(\lambda) + R_{substrate}(\lambda)} $$
+*(注：部分文献定义为 $\Delta R/R$，本工具采用归一化差异定义，数值范围通常在 -1 到 1 之间)*
+
+### 介电函数模型 (Lorentz)
+二维材料的介电函数 $\epsilon(E)$ 描述为背景加上若干个洛伦兹振子：
+$$ \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j} $$
+
+### 传输矩阵法 (TMM)
 本工具基于菲涅尔方程 (Fresnel Equations) 和传输矩阵法 (Transfer Matrix Method)。
 对于多层膜结构，我们构建特征矩阵 $M$，其中每一层的传输矩阵为：
 $$ M_j = \begin{pmatrix} \cos\delta_j & -\frac{i}{p_j}\sin\delta_j \\ -ip_j\sin\delta_j & \cos\delta_j \end{pmatrix} $$
