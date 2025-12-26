@@ -498,7 +498,7 @@ class FittingWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("2D Material Reflection Spectrum Fitting")
+        self.setWindowTitle("2D Material Reflectance Fitting")
         self.resize(1300, 900)
 
         # Data placeholders

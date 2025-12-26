@@ -197,7 +197,7 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, structure
 # --- Streamlit App ---
 
 st.set_page_config(page_title="2D Material Reflection Fitting", layout="wide")
-st.title("2D Material Reflection Spectrum Fitting")
+st.title("2D Material Reflectance Fitting")
 
 # Sidebar - Files
 st.sidebar.header("1. Material Data (Target)")
