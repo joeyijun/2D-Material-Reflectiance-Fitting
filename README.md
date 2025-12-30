@@ -48,7 +48,7 @@
 
 ### 方式一：Web 版 (推荐)
 **无需安装任何 Python 环境**。
-1.  **在线访问**: 点击 [https://reflectiance.streamlit.app/](https://reflectiance.streamlit.app/) 直接使用。
+1.  **在线访问**: 点击 [https://reflectance.streamlit.app/](https://reflectance.streamlit.app/) 直接使用。
 2.  **或者本地运行**: 直接用浏览器（Chrome/Edge）打开项目根目录下的 `index.html` 文件。
 
 ### 方式二：桌面版 (PyQt6)
