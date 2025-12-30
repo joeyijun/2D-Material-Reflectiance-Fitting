@@ -24,8 +24,8 @@
     *   2D Material: 单层或少层样品。
 *   **温度相关性**: 内置 Si 折射率的温度修正模型 (10K - 300K)，适用于低温光谱拟合。
 *   **Lorentz 介电函数**: 使用经典洛伦兹振子模型描述激子吸收：
-    
-    $$
+
+  $$
     \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
     $$
 
@@ -73,11 +73,11 @@
 
 ### 2. 载入与设置
 1.  **Upload Files**: 分别上传衬底和样品光谱文件。程序会自动计算实验对比度：
-    
-    $$
+
+   $$
     C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}}
-    $$
-    
+   $$
+
 2.  **Structure Config**: 设置实验样品的物理结构（如 SiO2 厚度 285nm，是否覆盖 hBN 等）。
 3.  **Material Data**: 默认使用内置的 Si (n,k) 数据。如有特殊需求，可上传自定义的 Si 折射率文件。
 
