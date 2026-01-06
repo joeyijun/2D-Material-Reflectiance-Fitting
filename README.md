@@ -26,8 +26,8 @@
 *   **温度相关性**: 内置 Si 折射率的温度修正模型 (10K - 300K)，适用于低温光谱拟合。
 *   **Lorentz 介电函数**: 使用经典洛伦兹振子模型描述激子吸收：
     
-    $$
-    \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
+  $$
+  \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
     $$
 
 ### 3. 先进的拟合算法
@@ -76,12 +76,14 @@
 
 ### 2. 载入与设置
 1.  **Upload Files**: 分别上传衬底和样品光谱文件。程序会自动计算实验对比度：
+
+   $$
+    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}}
     $$
-    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{ref}}
-    $$
-    *(注: 部分实验定义分母为 $R_{sample} + R_{sub}$，本工具默认使用 $(R_{sample} - R_{ref}) / R_{ref}$ 或根据配置调整)*
-2.  **Structure Config**: 设置实验样品的物理结构（如 SiO2 厚度 285nm，是否覆盖 hBN 等）。
-3.  **Material Data**: 默认使用内置的 Si (n,k) 数据。如有特殊需求，可上传自定义的 Si 折射率文件。
+    
+    *(注: 本工具采用归一化差异定义，数值范围通常在 -1 到 1 之间*
+3.  **Structure Config**: 设置实验样品的物理结构（如 SiO2 厚度 285nm，是否覆盖 hBN 等）。
+4.  **Material Data**: 默认使用内置的 Si (n,k) 数据。如有特殊需求，可上传自定义的 Si 折射率文件。
 
 ### 3. 设置激子 (Excitons)
 *   **Auto-Guess**: 点击 "Auto Guess" 按钮，程序会自动在 ROI 范围内寻找峰位。
@@ -131,7 +133,8 @@ The tool offers two modes of operation:
     *   2D Material: Monolayer or few-layer samples.
 *   **Temperature Dependence**: Built-in temperature-dependent refractive index model for Silicon (10K - 300K), ideal for low-temperature spectroscopy.
 *   **Lorentz Dielectric Function**: Describes exciton absorption using the classical Lorentz oscillator model:
-    $$
+  
+  $$  
     \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
     $$
 
@@ -181,11 +184,13 @@ You need two sets of experimental data:
 
 ### 2. Load & Setup
 1.  **Upload Files**: Upload both spectra. The program calculates contrast:
+
+$$
+    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}}
     $$
-    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{ref}}
-    $$
-2.  **Structure Config**: Define the physical structure (e.g., SiO2 thickness, hBN layers).
-3.  **Material Data**: Uses built-in Si (n,k) data by default. Custom data can be uploaded if needed.
+    
+3.  **Structure Config**: Define the physical structure (e.g., SiO2 thickness, hBN layers).
+4.  **Material Data**: Uses built-in Si (n,k) data by default. Custom data can be uploaded if needed.
 
 ### 3. Exciton Setup
 *   **Auto-Guess**: Click to automatically find peaks within the ROI.
