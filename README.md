@@ -1,6 +1,7 @@
 # 2D Material Optical Contrast Fitting Tool (2D材料光学对比度拟合工具)
 
 ## 项目简介 (Introduction)
+
 本项目是一个用于分析和拟合二维材料（如 $\text{MoS}_2$, $\text{WS}_2$, $\text{WSe}_2$ 等）光学反射对比度（Optical Contrast）谱的专业工具。它结合了**传输矩阵法 (Transfer Matrix Method, TMM)** 和 **洛伦兹振子模型 (Lorentz Oscillator Model)**，能够从实验测量的反射光谱中精确提取材料的关键光学参数（如激子峰位、振子强度、展宽等）。
 
 本项目提供两种使用方式，满足不同场景需求：
@@ -24,15 +25,17 @@
     *   2D Material: 单层或少层样品。
 *   **温度相关性**: 内置 Si 折射率的温度修正模型 (10K - 300K)，适用于低温光谱拟合。
 *   **Lorentz 介电函数**: 使用经典洛伦兹振子模型描述激子吸收：
-
-  $$
+    
+    $$
     \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
     $$
 
 ### 3. 先进的拟合算法
 *   **多种拟合策略**:
-    *   **Standard**: 传统的最小二乘法拟合。
+    *   **Standard**: 传统的最小二乘法拟合，速度快。
     *   **High Precision (Global)**: 使用差分进化算法 (Differential Evolution) 进行全局寻优，避免陷入局部极小值。
+    *   **Multi-Stage**: 多阶段拟合策略，按粗略 $\rightarrow$ 中等 $\rightarrow$ 高精度的顺序逐步优化，提高收敛稳定性。
+    *   **MCMC (Basin Hopping)**: 基于蒙特卡洛马尔可夫链的全局优化算法，有效克服多维参数空间的局部极值问题，适合复杂谱线。
     *   **Derivative (导数拟合)**: 拟合光谱的一阶导数 ($dC/dE$)，极大地提高了对微弱激子峰和峰位的敏感度，消除背景干扰。
     *   **2nd Derivative**: 二阶导数拟合，进一步增强对精细结构的解析能力。
 *   **Auto-Guess (自动猜峰)**: 基于峰值检测算法，自动从实验数据中识别潜在的激子峰位，减少手动设置参数的繁琐。
@@ -48,7 +51,7 @@
 
 ### 方式一：Web 版 (推荐)
 **无需安装任何 Python 环境**。
-1.  **在线访问**: 点击 [https://reflectance.streamlit.app/](https://reflectance.streamlit.app/) 直接使用。
+1.  **在线访问**: 点击 [https://reflectiance.streamlit.app/](https://reflectiance.streamlit.app/) 直接使用。
 2.  **或者本地运行**: 直接用浏览器（Chrome/Edge）打开项目根目录下的 `index.html` 文件。
 
 ### 方式二：桌面版 (PyQt6)
@@ -73,11 +76,10 @@
 
 ### 2. 载入与设置
 1.  **Upload Files**: 分别上传衬底和样品光谱文件。程序会自动计算实验对比度：
-
-   $$
-    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}}
-   $$
-
+    $$
+    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{ref}}
+    $$
+    *(注: 部分实验定义分母为 $R_{sample} + R_{sub}$，本工具默认使用 $(R_{sample} - R_{ref}) / R_{ref}$ 或根据配置调整)*
 2.  **Structure Config**: 设置实验样品的物理结构（如 SiO2 厚度 285nm，是否覆盖 hBN 等）。
 3.  **Material Data**: 默认使用内置的 Si (n,k) 数据。如有特殊需求，可上传自定义的 Si 折射率文件。
 
@@ -97,7 +99,6 @@
 *   点击 **Download Fit Parameters** 导出拟合得到的物理参数。
 
 ---
-
 ## 文件结构说明
 *   `index.html`: Web 版主程序（包含前端和嵌入的 Python 逻辑），单文件部署。
 *   `gui_app.py`: 桌面版主程序入口 (PyQt6)。
@@ -105,33 +106,106 @@
 *   `materials.py`: 核心材料折射率库和处理逻辑。
 *   `Si_data.csv`: 默认的硅折射率数据源。
 
+# English Version
+
+## Introduction
+
+This project is a professional tool designed for analyzing and fitting the **Optical Contrast** spectra of 2D materials (e.g., $\text{MoS}_2$, $\text{WS}_2$, $\text{WSe}_2$). By combining the **Transfer Matrix Method (TMM)** with the **Lorentz Oscillator Model**, it accurately extracts key optical properties (such as exciton peak positions, oscillator strengths, and broadening) from experimental reflection spectra.
+
+The tool offers two modes of operation:
+1.  **Web Version (Streamlit)**: Runs directly in a browser via a single HTML file (`index.html`) without complex installation. Includes a modern, user-friendly interface.
+2.  **Desktop Version (PyQt6)**: A full-featured desktop application suitable for batch processing and advanced customization.
+
+## Key Features
+
+### 1. Data Processing & Visualization
+*   **Multi-Format Support**: Compatible with common formats like `.csv` and `.txt`.
+*   **Smart Unit Recognition**: Automatically detects and standardizes wavelength (nm) or energy (eV) units.
+*   **Auto-Interpolation**: Automatically interpolates sample spectra onto the substrate's wavelength grid for precise contrast calculation.
+*   **Interactive Plotting**: Real-time updates during fitting, with support for zooming, data inspection, and high-quality image export.
+
+### 2. Precise Physical Modeling
+*   **Multi-Layer TMM Calculation**: Supports arbitrary stack structures:
+    *   Substrate: Si (with temp correction), Quartz, Sapphire, TiO2, etc.
+    *   Dielectric: SiO2, hBN (Top/Bottom encapsulation).
+    *   2D Material: Monolayer or few-layer samples.
+*   **Temperature Dependence**: Built-in temperature-dependent refractive index model for Silicon (10K - 300K), ideal for low-temperature spectroscopy.
+*   **Lorentz Dielectric Function**: Describes exciton absorption using the classical Lorentz oscillator model:
+    $$
+    \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
+    $$
+
+### 3. Advanced Fitting Algorithms
+*   **Multiple Strategies**:
+    *   **Standard**: Traditional Least Squares fitting for speed.
+    *   **High Precision (Global)**: Uses Differential Evolution for global optimization to avoid local minima.
+    *   **Multi-Stage**: Sequential optimization strategy (Coarse $\rightarrow$ Medium $\rightarrow$ Fine) to improve convergence stability.
+    *   **MCMC (Basin Hopping)**: Monte Carlo Markov Chain based global optimization, effective for complex multidimensional parameter spaces.
+    *   **Derivative**: Fits the first derivative of the spectrum ($dC/dE$), significantly enhancing sensitivity to weak exciton peaks and eliminating background offsets.
+    *   **2nd Derivative**: Second-order derivative fitting for resolving fine spectral structures.
+*   **Auto-Guess**: Automatically identifies potential exciton peaks from experimental data using peak detection algorithms.
+*   **Constraints & Locking**: Supports parameter bounds and locking specific parameters (e.g., fixing a known peak position) during fitting.
+
+### 4. Export Results
+*   **Data Export**: Download experimental vs. fitted contrast data alongside wavelength/energy as CSV.
+*   **Parameter Export**: Download extracted physical parameters ($\epsilon_\infty, f, E_0, \Gamma$) as CSV.
+
 ---
 
-## 物理原理简述
+## Quick Start
 
-### 光学对比度 (Optical Contrast)
-对比度定义为：
+### Option 1: Web Version (Recommended)
+**No Python environment required.**
+1.  **Online**: Visit [https://reflectiance.streamlit.app/](https://reflectiance.streamlit.app/).
+2.  **Local Run**: Simply open the `index.html` file in your browser (Chrome/Edge).
 
-$$
-C(\lambda) = \frac{R_{sample}(\lambda) - R_{substrate}(\lambda)}{R_{sample}(\lambda) + R_{substrate}(\lambda)}
-$$
+### Option 2: Desktop Version (PyQt6)
+For developers or high-performance local computing.
+1.  **Setup Environment**:
+    ```bash
+    pip install numpy pandas scipy matplotlib PyQt6
+    ```
+2.  **Run Application**:
+    ```bash
+    python gui_app.py
+    ```
 
-*(注：部分文献定义为 $\Delta R/R$，本工具采用归一化差异定义，数值范围通常在 -1 到 1 之间)*
+---
 
-### 介电函数模型 (Lorentz Model)
-二维材料的介电函数 $\epsilon(E)$ 描述为背景加上若干个洛伦兹振子：
+## Usage Guide
 
-$$
-\epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
-$$
+### 1. Data Preparation
+You need two sets of experimental data:
+*   **Substrate Spectrum (Ref)**: Reflection spectrum from a bare substrate region.
+*   **Sample Spectrum**: Reflection spectrum from the region with the 2D material.
 
-### 传输矩阵法 (Transfer Matrix Method)
-本工具基于菲涅尔方程 (Fresnel Equations) 和传输矩阵法 (TMM)。对于多层膜结构，每一层的传输矩阵 $M_j$ 为：
+### 2. Load & Setup
+1.  **Upload Files**: Upload both spectra. The program calculates contrast:
+    $$
+    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{ref}}
+    $$
+2.  **Structure Config**: Define the physical structure (e.g., SiO2 thickness, hBN layers).
+3.  **Material Data**: Uses built-in Si (n,k) data by default. Custom data can be uploaded if needed.
 
-$$
-M_j = \begin{pmatrix} \cos\delta_j & -\frac{i}{p_j}\sin\delta_j \\ -ip_j\sin\delta_j & \cos\delta_j \end{pmatrix}
-$$
+### 3. Exciton Setup
+*   **Auto-Guess**: Click to automatically find peaks within the ROI.
+*   **Manual Add**: Manually add oscillators and adjust initial guesses.
+*   **Lock**: Use the "🔒" checkbox to fix known parameters.
 
-其中 $\delta_j = \frac{2\pi d_j \tilde{n}_j}{\lambda}$ 为相位厚度。
-通过求解全系统的特征矩阵，获得系统的总反射系数 $r$，进而得到反射率 $R = |r|^2$。
-对比度的计算基于实验测量的相对差值，消除了光源强度等系统误差。
+### 4. Fitting
+1.  **ROI Range**: Set the energy range of interest (e.g., 1.5 eV - 3.0 eV).
+2.  **Method**: Choose a fitting strategy. Start with **Standard**, then try **High Precision** or **Derivatives** if needed.
+3.  **Start Fitting**: Run the fit and wait for completion.
+
+### 5. Analysis
+*   View the red fitted curve overlaid on experimental data.
+*   Use the **Download** buttons to save spectra and parameters.
+
+---
+
+## File Structure
+*   `index.html`: Web version (contains frontend + embedded Python), single-file deployment.
+*   `gui_app.py`: Desktop application entry point (PyQt6).
+*   `streamlit_app.py`: Source code for the Web version (compiled into index.html).
+*   `materials.py`: Core material library and physics logic.
+*   `Si_data.csv`: Default Silicon refractive index data.
