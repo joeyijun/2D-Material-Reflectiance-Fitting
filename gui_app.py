@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QCheckBox, QComboBox)
 from PyQt6.QtWidgets import QSpinBox, QProgressBar, QScrollArea
 from PyQt6.QtWidgets import QGridLayout
+from PyQt6.QtWidgets import QAbstractItemView
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -448,6 +449,7 @@ class MainWindow(QMainWindow):
         
         # Post-initialization UI updates
         self.on_substrate_changed(0) 
+        self._update_action_states()
 
     def init_materials(self):
         if os.path.exists(self.si_data_path):
@@ -466,32 +468,36 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
         
         # --- File Selection ---
-        group_files = QGroupBox("File Selection")
+        group_files = QGroupBox("1. Experimental Data")
         form_files = QFormLayout()
         
-        self.btn_sub = QPushButton("Select Substrate File")
+        self.btn_sub = QPushButton("Choose Reference Spectrum...")
+        self.btn_sub.setToolTip("Load R0: the substrate/reference-region spectrum")
         self.btn_sub.clicked.connect(self.load_substrate)
         # self.lbl_sub = QLabel("None") # Removed
         
-        self.btn_samp = QPushButton("Select Sample File")
+        self.btn_samp = QPushButton("Choose Sample Spectrum...")
+        self.btn_samp.setToolTip("Load Rs: the spectrum measured on the 2D-material region")
         self.btn_samp.clicked.connect(self.load_sample)
         # self.lbl_samp = QLabel("None") # Removed
         
         self.status_label = QLabel("Initializing...")
+        self.status_label.setWordWrap(True)
         
-        form_files.addRow("Substrate:", self.btn_sub)
+        form_files.addRow("Reference R0:", self.btn_sub)
         # form_files.addRow("", self.lbl_sub) # Removed
-        form_files.addRow("Sample:", self.btn_samp)
+        form_files.addRow("Sample Rs:", self.btn_samp)
         # form_files.addRow("", self.lbl_samp) # Removed
-        form_files.addRow("System:", self.status_label)
+        form_files.addRow("Status:", self.status_label)
         
         group_files.setLayout(form_files)
         layout.addWidget(group_files)
         
         # --- Structure & Constants ---
-        group_struct = QGroupBox("Structure Configuration")
+        group_struct = QGroupBox("2. Layer Stack (incident side -> substrate)")
         struct_layout = QVBoxLayout()
         form_struct = QFormLayout()
         
@@ -552,6 +558,7 @@ class MainWindow(QMainWindow):
             "hBN / Sample / hBN / SiO2 / Si",
             "hBN / Graphene / Sample / Graphene / hBN / SiO2 / Si",
         ])
+        self.combo_structure_preset.setToolTip("Replace the current layer table with a common stack")
         btn_preset = QPushButton("Apply Preset")
         btn_preset.clicked.connect(self.apply_structure_preset)
         preset_row.addWidget(QLabel("Preset:"))
@@ -559,12 +566,35 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(btn_preset)
         struct_layout.addLayout(preset_row)
 
+        layer_hint = QLabel(
+            "Top-to-bottom order. Enable Fit only for unknown thicknesses."
+        )
+        layer_hint.setWordWrap(True)
+        layer_hint.setStyleSheet("color: #666;")
+        struct_layout.addWidget(layer_hint)
+
         self.table_layers = CopyableTableWidget(0, 6)
         self.table_layers.setHorizontalHeaderLabels([
             "Material", "Thickness (nm)", "In reference", "Fit", "Min (nm)", "Max (nm)"
         ])
         self.table_layers.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table_layers.setMinimumHeight(150)
+        self.table_layers.verticalHeader().setVisible(False)
+        self.table_layers.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_layers.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_layers.setAlternatingRowColors(True)
+        self.table_layers.cellChanged.connect(self.on_model_configuration_changed)
+        layer_header_help = {
+            0: "Layer material; Sample uses the fitted excitonic dielectric function",
+            1: "Physical layer thickness",
+            2: "Keep this layer in the R0 reference stack",
+            3: "Include this thickness as a fit parameter",
+            4: "Lower thickness bound when Fit is enabled",
+            5: "Upper thickness bound when Fit is enabled",
+        }
+        for column, help_text in layer_header_help.items():
+            self.table_layers.horizontalHeaderItem(column).setToolTip(help_text)
+        self.table_layers.setMinimumHeight(100)
+        self.table_layers.setMaximumHeight(130)
         struct_layout.addWidget(self.table_layers)
         layer_buttons = QHBoxLayout()
         for label, callback in (
@@ -581,7 +611,7 @@ class MainWindow(QMainWindow):
         self.apply_structure_preset()
 
         # --- Fitting Optimization ---
-        group_opt = QGroupBox("Fitting Optimization")
+        group_opt = QGroupBox("3. Fit Setup")
         layout_opt = QGridLayout()
         
         self.spin_range_min = QDoubleSpinBox()
@@ -604,12 +634,19 @@ class MainWindow(QMainWindow):
             "1st Derivative + LM",
             "2nd Derivative + LM",
         ])
+        self.combo_fit_method.currentIndexChanged.connect(self.on_model_configuration_changed)
+        self.combo_fit_method.setToolTip(
+            "Robust LM is the default. Global search is slower; derivative modes emphasize fine structure."
+        )
         layout_opt.addWidget(QLabel("Method:"), 1, 0)
         layout_opt.addWidget(self.combo_fit_method, 1, 1, 1, 3)
 
         self.combo_line_shape = QComboBox()
         self.combo_line_shape.addItems(["Voigt / Faddeeva (Recommended)", "Lorentz"])
         self.combo_line_shape.currentIndexChanged.connect(self.on_line_shape_changed)
+        self.combo_line_shape.setToolTip(
+            "Voigt separates homogeneous (wL) and inhomogeneous (wG) broadening"
+        )
         layout_opt.addWidget(QLabel("Line shape:"), 2, 0)
         layout_opt.addWidget(self.combo_line_shape, 2, 1, 1, 3)
 
@@ -629,13 +666,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(group_opt)
         
         # --- Excitons ---
-        group_excitons = QGroupBox("Excitons")
+        group_excitons = QGroupBox("4. Exciton Resonances")
         vbox_exc = QVBoxLayout()
         
         # Update Table Columns: f, Lock, E0, Lock, G, Lock (Interleaved)
         self.table_exc = CopyableTableWidget(0, 8)
         self.table_exc.setHorizontalHeaderLabels(["f", "Lock", "E0", "Lock", "wL", "Lock", "wG", "Lock"])
         self.table_exc.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_exc.verticalHeader().setVisible(False)
+        self.table_exc.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_exc.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_exc.setAlternatingRowColors(True)
+        self.table_exc.setMinimumHeight(100)
+        self.table_exc.setMaximumHeight(130)
+        self.table_exc.itemChanged.connect(self.on_model_configuration_changed)
         # Resize lock columns to be small
         for c in [1,3,5,7]:
             self.table_exc.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
@@ -644,13 +688,14 @@ class MainWindow(QMainWindow):
         hbox_exc_btns = QHBoxLayout()
         btn_add = QPushButton("Add Exciton")
         btn_add.clicked.connect(self.add_exciton)
-        btn_auto = QPushButton("Auto-Guess")
-        btn_auto.clicked.connect(self.auto_guess_excitons)
+        self.btn_auto_guess = QPushButton("Auto Guess from ROI")
+        self.btn_auto_guess.setToolTip("Replace the resonance table using features detected inside the ROI")
+        self.btn_auto_guess.clicked.connect(self.auto_guess_excitons)
         btn_rem = QPushButton("Remove Selected")
         btn_rem.clicked.connect(self.remove_exciton)
         
         hbox_exc_btns.addWidget(btn_add)
-        hbox_exc_btns.addWidget(btn_auto)
+        hbox_exc_btns.addWidget(self.btn_auto_guess)
         hbox_exc_btns.addWidget(btn_rem)
         
         vbox_exc.addWidget(self.table_exc)
@@ -667,6 +712,7 @@ class MainWindow(QMainWindow):
         self.btn_plot.clicked.connect(self.preview_data)
 
         self.btn_fit = QPushButton("Start Fitting")
+        self.btn_fit.setToolTip("Fit the optical model using the current layer and resonance tables")
         self.btn_fit.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
         self.btn_fit.clicked.connect(self.start_fitting)
         
@@ -676,17 +722,21 @@ class MainWindow(QMainWindow):
         self.btn_export_data = QPushButton("Export Data")
         self.btn_export_data.clicked.connect(self.export_data)
         
+        group_actions = QGroupBox("5. Run & Export")
+        actions_layout = QVBoxLayout()
         hbox_actions_top = QHBoxLayout()
         hbox_actions_top.addWidget(self.btn_plot)
         hbox_actions_top.addWidget(self.btn_save_img)
         hbox_actions_top.addWidget(self.btn_export_data)
         
-        layout.addLayout(hbox_actions_top)
-        layout.addWidget(self.btn_fit)
+        actions_layout.addLayout(hbox_actions_top)
+        actions_layout.addWidget(self.btn_fit)
         self.fit_progress = QProgressBar()
         self.fit_progress.setRange(0, 100)
         self.fit_progress.setVisible(False)
-        layout.addWidget(self.fit_progress)
+        actions_layout.addWidget(self.fit_progress)
+        group_actions.setLayout(actions_layout)
+        layout.addWidget(group_actions)
         
         layout.addStretch()
         panel.setMinimumWidth(560)
@@ -698,6 +748,10 @@ class MainWindow(QMainWindow):
 
     def setup_plot_area(self):
         self.canvas = MplCanvas(self, width=5, height=4, dpi=100)
+        self.canvas.axes.set_title("Load reference and sample spectra to begin")
+        self.canvas.axes.set_xlabel("Energy (eV)")
+        self.canvas.axes.set_ylabel("Relative contrast (Rs - R0) / R0")
+        self.canvas.draw()
         self.main_layout.addWidget(self.canvas, 2)
         # Connect mouse event for cursor
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
@@ -712,11 +766,34 @@ class MainWindow(QMainWindow):
         self.last_y_exp = None
         self.last_y_fit = None
 
+    def _update_action_states(self):
+        """Keep actions aligned with the current workflow state."""
+        if not hasattr(self, 'btn_fit'):
+            return
+        data_ready = bool(self.sub_path and self.samp_path and self.mat_loader)
+        has_resonance = self.table_exc.rowCount() > 0
+        has_plot = self.last_y_exp is not None
+        self.btn_plot.setEnabled(data_ready)
+        self.btn_auto_guess.setEnabled(data_ready)
+        self.btn_fit.setEnabled(data_ready and has_resonance)
+        self.btn_save_img.setEnabled(has_plot)
+        self.btn_export_data.setEnabled(has_plot)
+        if self.mat_loader is None:
+            self.status_label.setText("Model data unavailable: Si_data.csv is required.")
+            self.status_label.setStyleSheet("color: #b00020;")
+        elif not self.sub_path or not self.samp_path:
+            self.status_label.setText("Choose both reference and sample spectra to continue.")
+            self.status_label.setStyleSheet("color: #555;")
+        else:
+            self.status_label.setText("Data ready. Preview or run Auto Guess, then fit.")
+            self.status_label.setStyleSheet("color: #187a2f;")
+
     def _table_checkbox(self, checked=False, enabled=True):
         cell = QWidget()
         checkbox = QCheckBox()
         checkbox.setChecked(bool(checked))
         checkbox.setEnabled(enabled)
+        checkbox.stateChanged.connect(self.on_model_configuration_changed)
         layout = QHBoxLayout(cell)
         layout.addWidget(checkbox)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -743,8 +820,11 @@ class MainWindow(QMainWindow):
             if is_sample:
                 checkbox.setChecked(False)
             checkbox.setEnabled(not is_sample)
+            self.on_model_configuration_changed()
         material_box.currentTextChanged.connect(update_reference_state)
         self.table_layers.setCellWidget(row, 3, self._table_checkbox(fit))
+        self.table_layers.setCurrentCell(row, 1)
+        self.on_model_configuration_changed()
 
     def _layer_row_data(self, row):
         material = self.table_layers.cellWidget(row, 0).currentText()
@@ -783,11 +863,13 @@ class MainWindow(QMainWindow):
         self.table_layers.setRowCount(0)
         for row in presets[self.combo_structure_preset.currentIndex()]:
             self.add_structure_layer(*row)
+        self.on_model_configuration_changed()
 
     def remove_structure_layer(self):
         row = self.table_layers.currentRow()
         if row >= 0:
             self.table_layers.removeRow(row)
+            self.on_model_configuration_changed()
 
     def move_structure_layer(self, direction):
         row = self.table_layers.currentRow()
@@ -798,6 +880,7 @@ class MainWindow(QMainWindow):
         self.table_layers.removeRow(row)
         self.add_structure_layer(*data, row=target)
         self.table_layers.setCurrentCell(target, 1)
+        self.on_model_configuration_changed()
 
     def on_substrate_changed(self, index):
         # Advanced substrate settings remain code-level defaults.
@@ -807,6 +890,23 @@ class MainWindow(QMainWindow):
         show_gaussian = index == 0
         self.table_exc.setColumnHidden(6, not show_gaussian)
         self.table_exc.setColumnHidden(7, not show_gaussian)
+        self.on_model_configuration_changed()
+
+    def on_model_configuration_changed(self, *_args):
+        """Invalidate a displayed fit when model inputs change."""
+        if not hasattr(self, 'last_y_fit') or self.last_y_fit is None:
+            return
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            return
+        self.last_y_fit = None
+        self.last_fit_result = None
+        for line in list(self.canvas.axes.lines):
+            if line.get_label() == 'Fit Model':
+                line.remove()
+        self.canvas.draw_idle()
+        self._update_action_states()
+        self.status_label.setText("Model settings changed. Run the fit again.")
+        self.status_label.setStyleSheet("color: #b26a00;")
 
     def on_si_data_changed(self, filename):
         if not filename:
@@ -883,6 +983,7 @@ class MainWindow(QMainWindow):
             self.table_exc.setRowCount(0)
             for energy, linewidth in guesses:
                 self.add_exciton_values(0.1, round(energy, 4), round(linewidth, 4))
+            self._update_action_states()
 
     def add_exciton_values(self, f, E0, gamma, gaussian=0.01, locks=(False, False, False, False)):
         row = self.table_exc.rowCount()
@@ -905,6 +1006,7 @@ class MainWindow(QMainWindow):
            layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
            layout.setContentsMargins(0,0,0,0)
            self.table_exc.setCellWidget(row, col, cell_widget)
+        self._update_action_states()
 
     def _get_lock_state(self, row, col_index):
         # col_index passed directly (1, 3, 5)
@@ -920,6 +1022,8 @@ class MainWindow(QMainWindow):
         current_row = self.table_exc.currentRow()
         if current_row >= 0:
             self.table_exc.removeRow(current_row)
+        self._update_action_states()
+        self.on_model_configuration_changed()
 
     def load_substrate(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Substrate File", "", "Data Files (*.csv *.txt *.dat);;All Files (*)")
@@ -927,6 +1031,7 @@ class MainWindow(QMainWindow):
             self.sub_path = path
             self.btn_sub.setText(f"Substrate: {os.path.basename(path)}")
             self._infer_sio2_thickness_from_filename(path)
+            self._update_action_states()
     
     def load_sample(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Sample File", "", "Data Files (*.csv *.txt *.dat);;All Files (*)")
@@ -934,6 +1039,7 @@ class MainWindow(QMainWindow):
             self.samp_path = path
             self.btn_samp.setText(f"Sample: {os.path.basename(path)}")
             self._infer_sio2_thickness_from_filename(path)
+            self._update_action_states()
 
     def _infer_sio2_thickness_from_filename(self, path):
         filename = os.path.basename(path)
@@ -1051,6 +1157,7 @@ class MainWindow(QMainWindow):
         self.last_x_ev = x_ev
         self.last_y_exp = y_contrast
         self.last_y_fit = None
+        self._update_action_states()
 
     def save_plot_image(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save Plot Image", "", "PNG Image (*.png);;JPEG Image (*.jpg);;PDF Document (*.pdf)")
@@ -1274,6 +1381,8 @@ class MainWindow(QMainWindow):
         self.btn_fit.setStyleSheet("")
         self.status_label.setText("Fitting stopped by user.")
         self.fit_progress.setVisible(False)
+        self._update_action_states()
+        self.status_label.setText("Fitting stopped. Parameters were not changed.")
 
     def on_fit_progress(self, value, message):
         self.fit_progress.setValue(value)
@@ -1315,6 +1424,9 @@ class MainWindow(QMainWindow):
         self.last_y_exp = y_data
         self.last_y_fit = y_fit
         self.last_fit_result = getattr(self.worker, 'fit_result', None)
+        self._update_action_states()
+        self.status_label.setText(f"Fit complete. Global R2 = {r_squared:.5f}")
+        self.status_label.setStyleSheet("color: #187a2f;")
         fitted_layers = getattr(self.worker, 'fitted_layers', [])
         for row, layer in enumerate(fitted_layers):
             if row < self.table_layers.rowCount():
@@ -1387,7 +1499,9 @@ class MainWindow(QMainWindow):
         self.btn_fit.setText("Start Fitting")
         self.btn_fit.setStyleSheet("") # Reset Color
         self.fit_progress.setVisible(False)
-        self.status_label.setText("Fit failed")
+        self._update_action_states()
+        self.status_label.setText(f"Fit failed: {err_msg}")
+        self.status_label.setStyleSheet("color: #b00020;")
         QMessageBox.critical(self, "Fitting Error", err_msg)
 
 if __name__ == "__main__":

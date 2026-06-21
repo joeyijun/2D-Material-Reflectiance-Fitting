@@ -249,9 +249,8 @@ st.set_page_config(page_title="2D Material Reflection Fitting", layout="wide")
 st.title("2D Material Reflectance Fitting")
 
 # Sidebar - Files
-st.sidebar.header("1. Material Data (Target)")
+st.sidebar.header("1. Experimental Data")
 # --- Experimental Data Loading ---
-st.sidebar.subheader("Experimental Spectra")
 uploaded_sub_file = st.sidebar.file_uploader("Upload Substrate Spectrum (Ref)", type=["txt", "csv"])
 uploaded_samp_file = st.sidebar.file_uploader("Upload Sample Spectrum", type=["txt", "csv"])
 
@@ -299,13 +298,27 @@ if "structure_layers" not in st.session_state:
     initial_preset = list(layer_presets)[1 if hbn_filename_hint else 0]
     st.session_state.structure_layers = preset_layer_table(layer_presets[initial_preset])
 
-st.header("2. Structure & Optical Model")
+
+def apply_selected_structure_preset():
+    selected = st.session_state.structure_preset
+    st.session_state.structure_layers = preset_layer_table(layer_presets[selected])
+    st.session_state.pop("layer_editor", None)
+
+
+st.header("2. Layer Stack & Model")
 structure_col, optics_col = st.columns([2, 1])
 with structure_col:
     preset_col, apply_col = st.columns([4, 1])
-    selected_preset = preset_col.selectbox("Structure preset", list(layer_presets))
-    if apply_col.button("Apply", use_container_width=True):
-        st.session_state.structure_layers = preset_layer_table(layer_presets[selected_preset])
+    preset_col.selectbox(
+        "Structure preset", list(layer_presets), key="structure_preset"
+    )
+    apply_col.button(
+        "Apply", use_container_width=True, on_click=apply_selected_structure_preset
+    )
+    st.caption(
+        "Rows are ordered from the incident side to the substrate. Enable Fit only "
+        "for thicknesses that are not known independently."
+    )
     layer_df = st.data_editor(
         st.session_state.structure_layers,
         column_config={
@@ -323,6 +336,7 @@ with structure_col:
     st.session_state.structure_layers = layer_df
 
 with optics_col:
+    st.markdown("**Optical model**")
     sub_type = st.selectbox("Semi-infinite substrate", ["Si", "Quartz", "Sapphire", "TiO2"])
     line_shape = st.selectbox(
         "Exciton line shape", ["Voigt / Faddeeva (Recommended)", "Lorentz"]
@@ -344,6 +358,13 @@ config = {
     'numerical_aperture': numerical_aperture, 'contrast_definition': 'relative'
 }
 config['line_shape'] = 'Voigt' if line_shape.startswith('Voigt') else 'Lorentz'
+
+try:
+    normalized_layer_stack(config)
+    structure_error = None
+except ValueError as exc:
+    structure_error = str(exc)
+    st.error(f"Layer-stack error: {structure_error}")
 
 def make_model_signature(model_config):
     return (
@@ -433,9 +454,16 @@ if uploaded_sub_file and uploaded_samp_file:
     x_exp_ev, y_exp_contrast, err = process_experiments(uploaded_sub_file, uploaded_samp_file)
     if err:
         st.error(f"Error processing spectra: {err}")
+    else:
+        st.success(
+            f"Data ready: {len(x_exp_ev)} points, "
+            f"{np.min(x_exp_ev):.3f}-{np.max(x_exp_ev):.3f} eV"
+        )
+else:
+    st.info("Upload both reference and sample spectra in the sidebar to enable Auto Guess and fitting.")
 
 # Sidebar - Fitting
-st.sidebar.header("3. Fitting Setup")
+st.sidebar.header("3. Fit Setup")
 
 # Dynamic ROI Defaults
 def_min, def_max = 1.5, 3.0
@@ -468,7 +496,7 @@ col1, col2 = st.columns([3, 2])
 # But process_experiments logic was moved up. The original block down here is now redundant/needs removal.
 
 with col1:
-    st.subheader("Excitons Control")
+    st.subheader("4. Exciton Resonances")
     if 'excitons' not in st.session_state:
         # Use simple column names with emojis for UI
         st.session_state.excitons = pd.DataFrame([
@@ -524,9 +552,15 @@ with col1:
             st.error(f"Auto-guess error: {e}")
 
     col_btn1, col_btn2, col_btn3 = st.columns(3)
-    col_btn1.button("Add Exciton", on_click=add_exciton)
-    col_btn2.button("Clear", on_click=clear_excitons)
-    col_btn3.button("Auto Guess", on_click=auto_guess_excitons)
+    col_btn1.button("Add Resonance", on_click=add_exciton, use_container_width=True)
+    col_btn2.button(
+        "Clear", on_click=clear_excitons, use_container_width=True,
+        disabled=st.session_state.excitons.empty,
+    )
+    col_btn3.button(
+        "Auto Guess", on_click=auto_guess_excitons, use_container_width=True,
+        disabled=x_exp_ev is None,
+    )
     
     # Configure columns for better UI
     column_config = {
@@ -553,7 +587,31 @@ with col1:
     )
     st.session_state.excitons = edited_df
 
-    if st.button("Start Fitting", type="primary"):
+    def make_exciton_signature(table):
+        columns = ["f", "🔒f", "E0", "🔒E0", "wL", "🔒wL", "wG", "🔒wG"]
+        return tuple(
+            tuple(
+                bool(row[column]) if column.startswith("🔒")
+                else round(float(row[column]), 10)
+                for column in columns
+            )
+            for _, row in table.iterrows()
+        )
+
+    current_exciton_signature = make_exciton_signature(edited_df)
+    if 'fit_results' in st.session_state:
+        stored_exciton_signature = (
+            st.session_state.fit_results[6]
+            if len(st.session_state.fit_results) >= 7 else None
+        )
+        if stored_exciton_signature != current_exciton_signature:
+            del st.session_state.fit_results
+            st.info("Resonance settings changed. Run the fit again.")
+
+    if st.button(
+        "Run Fit", type="primary", use_container_width=True,
+        disabled=(x_exp_ev is None or edited_df.empty or structure_error is not None),
+    ):
         if x_exp_ev is None:
             st.error("Please upload both Substrate and Sample spectra first!")
         else:
@@ -759,6 +817,7 @@ with col1:
                         fit_result,
                         fitted_config,
                         make_model_signature(fitted_config),
+                        make_exciton_signature(st.session_state.excitons),
                     )
                     st.rerun()
                     
@@ -768,8 +827,8 @@ with col1:
     # --- Export Section (Moved to col1) ---
     if 'fit_results' in st.session_state:
         st.divider()
-        st.subheader("Export Results")
-        x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _ = st.session_state.fit_results
+        st.subheader("Fit Results")
+        x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _, _ = st.session_state.fit_results
 
         # Recalculate y_model for consistency
         # Warning: scope. Let's re-calculate basics.
@@ -781,18 +840,27 @@ with col1:
         )
         y_model_e = fit_result.add_baseline(physical_model_e, x_ev_export)
 
+        metric_r2, metric_rmse, metric_dw = st.columns(3)
+        metric_r2.metric("Global R2", f"{fit_result.r_squared:.5f}")
+        metric_rmse.metric("RMSE", f"{fit_result.rmse:.4g}")
+        metric_dw.metric("Durbin-Watson", f"{fit_result.durbin_watson:.3f}")
         st.caption(
-            f"{fit_result.method} | RMSE={fit_result.rmse:.4g} | "
-            f"R2={fit_result.r_squared:.5f} | condition={fit_result.jacobian_condition:.3g} | "
-            f"Durbin-Watson={fit_result.durbin_watson:.3f}"
+            f"{fit_result.method} | Jacobian condition={fit_result.jacobian_condition:.3g}"
         )
-        for index, diagnostic in enumerate(
-            getattr(fit_result, "resonance_diagnostics", []), start=1
-        ):
-            st.caption(
-                f"Local peak {index} ({diagnostic['center_ev']:.4f} eV): "
-                f"R2={diagnostic['local_r_squared']:.4f}, "
-                f"amplitude={diagnostic['amplitude_ratio']:.2f}x"
+        local_diagnostics = getattr(fit_result, "resonance_diagnostics", [])
+        if local_diagnostics:
+            st.markdown("**Per-resonance diagnostics**")
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Peak": index,
+                        "Center (eV)": diagnostic["center_ev"],
+                        "Local R2": diagnostic["local_r_squared"],
+                        "Amplitude ratio": diagnostic["amplitude_ratio"],
+                    }
+                    for index, diagnostic in enumerate(local_diagnostics, start=1)
+                ]),
+                hide_index=True, use_container_width=True,
             )
         fitted_layer_rows = [
             (index, layer) for index, layer in enumerate(fitted_config['layers']) if layer['fit']
@@ -804,6 +872,8 @@ with col1:
             )
         if fit_result.jacobian_condition > 1e10:
             st.warning("The Jacobian is ill-conditioned; some fitted parameters are not independently identifiable.")
+
+        st.markdown("**Export**")
         
         # 1. Export Spectrum Data
         export_df = pd.DataFrame({
@@ -851,7 +921,7 @@ with col1:
         )
 
 with col2:
-    st.subheader("Plot")
+    st.subheader("5. Spectrum & Fit")
     
     fig, ax = plt.subplots()
     ax.set_xlabel("Energy (eV)")
@@ -863,7 +933,7 @@ with col2:
         
         # Plot Fit
         if 'fit_results' in st.session_state:
-            x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _ = st.session_state.fit_results
+            x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _, _ = st.session_state.fit_results
             # Show Fit
             wl_full = HC_EV_NM / x_exp_ev
             dielectric_model = dielectric_func_voigt if fitted_config.get('line_shape') == 'Voigt' else dielectric_func_lorentz

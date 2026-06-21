@@ -40,6 +40,7 @@
 *   **任意层堆栈表**: 按入射侧到基底侧逐行设置 `Sample`、hBN、Graphene、SiO2、Quartz、Sapphire 或 TiO2。每层可独立设置厚度、参考区域、是否拟合及拟合上下界，并提供常见封装结构预设。
 *   **拟合控制**: 界面保留优化预算和分阶段进度；E0 搜索半宽及背景阶数使用代码默认值。
 *   **弱峰保护**: 每个初始共振区域按自身去趋势幅度平衡残差，并报告逐峰局部 $R^2$ 和振幅恢复率，避免高全谱 GOF 掩盖弱峰漏拟合。
+*   **引导式操作**: 界面按数据、层结构、拟合设置、共振和结果分步组织；无效操作自动禁用，修改模型或共振后旧拟合自动失效。
 *   **可分离慢变背景**: 每次非线性迭代中用线性最小二乘消去三阶慢变漂移，避免将光源/探测器基线误归因于介电函数。
 *   **Auto-Guess (自动猜峰)**: 使用 Savitzky-Golay 平滑、低阶背景消除和鲁棒噪声阈值生成初值，并合并同一色散共振产生的相邻峰谷。
 *   **参数约束与锁定**: 支持设置参数范围 (Bounds) 和锁定特定参数 (Lock) 不参与拟合。
@@ -157,6 +158,7 @@ The tool offers two modes of operation:
 *   **Arbitrary Layer Table**: order Sample, hBN, Graphene, SiO2, Quartz, Sapphire, and TiO2 layers from the incident side to the substrate. Each row controls thickness, reference-region inclusion, fit state, and bounds.
 *   **Fit Controls**: the UI exposes the optimization budget and staged progress; E0 search width and baseline order use code defaults.
 *   **Weak-feature preservation**: resonance neighborhoods are balanced by their own detrended amplitudes and receive per-peak local $R^2$ and amplitude-recovery diagnostics.
+*   **Guided workflow**: data, layer stack, fit setup, resonances, and results are organized as explicit steps; unavailable actions are disabled and stale fits are invalidated automatically.
 *   **Variable-projection baseline**: cubic slow measurement drift is separated from nonlinear dielectric parameters.
 *   **Auto-Guess**: smoothed, detrended, noise-adaptive initialization that merges the peak/dip pair of one dispersive resonance.
 *   **Constraints & Locking**: Supports parameter bounds and locking specific parameters (e.g., fixing a known peak position) during fitting.

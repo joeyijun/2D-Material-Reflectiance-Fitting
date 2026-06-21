@@ -15,6 +15,10 @@ class EntrypointTests(unittest.TestCase):
         module = importlib.import_module("gui_app")
         app = module.QApplication.instance() or module.QApplication([])
         window = module.MainWindow()
+        self.assertFalse(window.btn_plot.isEnabled())
+        self.assertFalse(window.btn_auto_guess.isEnabled())
+        self.assertFalse(window.btn_fit.isEnabled())
+        self.assertFalse(window.btn_export_data.isEnabled())
         sources = [window.combo_si_data.itemText(i) for i in range(window.combo_si_data.count())]
         self.assertEqual(sources, ["Si_data.csv", "Schinke.csv", "Green-2008.csv"])
         self.assertEqual(window.table_layers.rowCount(), 2)
@@ -42,8 +46,20 @@ class EntrypointTests(unittest.TestCase):
             window.spin_eps_inf, window.spin_e0_margin, window.spin_baseline_order,
         ):
             self.assertFalse(advanced_widget.isVisible())
+        window.sub_path = "reference.csv"
+        window.samp_path = "sample.csv"
+        window._update_action_states()
+        self.assertTrue(window.btn_plot.isEnabled())
+        self.assertTrue(window.btn_auto_guess.isEnabled())
+        self.assertTrue(window.btn_fit.isEnabled())
+        self.assertFalse(window.btn_export_data.isEnabled())
         window.on_si_data_changed("Schinke.csv")
         self.assertIsNotNone(window.mat_loader)
+        window.last_y_fit = [0.0]
+        window.canvas.axes.plot([1.0], [0.0], label="Fit Model")
+        window.add_structure_layer()
+        self.assertIsNone(window.last_y_fit)
+        self.assertIn("settings changed", window.status_label.text())
         window.last_y_fit = [0.0]
         window.spin_na.setValue(0.5)
         self.assertIn("run fitting again", window.status_label.text())
