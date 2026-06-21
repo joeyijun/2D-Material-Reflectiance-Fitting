@@ -2,7 +2,7 @@
 
 ## 项目简介 (Introduction)
 
-本项目是一个用于分析和拟合二维材料（如 $\text{MoS}_2$, $\text{WS}_2$, $\text{WSe}_2$ 等）光学反射对比度（Optical Contrast）谱的专业工具。它结合了**传输矩阵法 (Transfer Matrix Method, TMM)** 和 **洛伦兹振子模型 (Lorentz Oscillator Model)**，能够从实验测量的反射光谱中精确提取材料的关键光学参数（如激子峰位、振子强度、展宽等）。
+本项目是一个用于分析和拟合二维材料（如 $\text{MoS}_2$, $\text{WS}_2$, $\text{WSe}_2$ 等）光学反射对比度（Optical Contrast）谱的专业工具。它结合了**传输矩阵法 (TMM)** 和 **Faddeeva-Voigt / Lorentz 振子模型**，用于提取激子峰位、振子强度及展宽。
 
 本项目提供两种使用方式，满足不同场景需求：
 1.  **Web 版 (Streamlit)**: 无需安装复杂环境，单文件 (`index.html`) 即可运行，支持离线使用，界面现代友好。
@@ -24,22 +24,27 @@
     *   Dielectric: SiO2, hBN (Top/Bottom 封装层)。
     *   2D Material: 单层或少层样品。
 *   **温度相关性**: 内置 Si 折射率的温度修正模型 (10K - 300K)，适用于低温光谱拟合。
-*   **Lorentz 介电函数**: 使用经典洛伦兹振子模型描述激子吸收：
+*   **有限数值孔径**: 对物镜入瞳进行 Gauss-Legendre 角度积分并平均 s/p 偏振；`NA=0` 时退化为法向入射模型。
+*   **受控材料插值**: Si 光学常数在 400--1305 nm 内使用保形 PCHIP，区间外使用端点切线线性延拓并保持被动性。
+*   **复 Voigt 介电函数（推荐）**: 使用 Faddeeva 函数分别拟合 Lorentz 均匀展宽 $w_L$ 和 Gaussian 非均匀展宽 $w_G$；经典 Lorentz 模型仍可选择。
     
   $$
   \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
     $$
 
 ### 3. 先进的拟合算法
-*   **多种拟合策略**:
-    *   **Standard**: 传统的最小二乘法拟合，速度快。
-    *   **High Precision (Global)**: 使用差分进化算法 (Differential Evolution) 进行全局寻优，避免陷入局部极小值。
-    *   **Multi-Stage**: 多阶段拟合策略，按粗略 $\rightarrow$ 中等 $\rightarrow$ 高精度的顺序逐步优化，提高收敛稳定性。
-    *   **MCMC (Basin Hopping)**: 基于蒙特卡洛马尔可夫链的全局优化算法，有效克服多维参数空间的局部极值问题，适合复杂谱线。
-    *   **Derivative (导数拟合)**: 拟合光谱的一阶导数 ($dC/dE$)，极大地提高了对微弱激子峰和峰位的敏感度，消除背景干扰。
-    *   **2nd Derivative**: 二阶导数拟合，进一步增强对精细结构的解析能力。
-*   **Auto-Guess (自动猜峰)**: 基于峰值检测算法，自动从实验数据中识别潜在的激子峰位，减少手动设置参数的繁琐。
+*   **量测级多阶段优化**:
+    *   **Robust LM (推荐)**: 先用有边界 `soft_l1` Trust Region Reflective 抑制坏点并定位，再通过有界参数变换使用真正的 Levenberg-Marquardt 精修。
+    *   **Global + Robust LM**: 先进行差分进化全局初始化，再执行 Robust TRF + LM，适用于初值不确定或多峰耦合情况。
+    *   **Derivative + LM**: 先用原始谱预热，再联合拟合原始谱与 Savitzky-Golay 平滑的 $dC/dE$ 或 $d^2C/dE^2$，避免噪声主导。
+*   **结构参数联合拟合**: 可联合拟合 SiO2 以及已启用的上/下 hBN 厚度。
+*   **可分离慢变背景**: 每次非线性迭代中用线性最小二乘消去三阶慢变漂移，避免将光源/探测器基线误归因于介电函数。
+*   **Auto-Guess (自动猜峰)**: 使用 Savitzky-Golay 平滑、低阶背景消除和鲁棒噪声阈值生成初值，并合并同一色散共振产生的相邻峰谷。
 *   **参数约束与锁定**: 支持设置参数范围 (Bounds) 和锁定特定参数 (Lock) 不参与拟合。
+*   **拟合诊断**: 输出参数标准误差、Jacobian 条件数、RMSE、约化卡方和 Durbin-Watson 残差指标；条件数过大时提示参数不可辨识。
+
+### Example 全谱验收
+仓库 WS2 示例在 `1.908--3.187 eV` 全谱上自动识别约 `2.10、2.50、3.06 eV` 三个振子。联合拟合 SiO2 厚度并使用三阶慢变基线后，鲁棒拟合 GOF（$R^2$）回归门槛为 `0.99`；当前三套 Si 数据的基准约为 `0.9944`，4--5 振子模型可进一步达到约 `0.996--0.997`。
 
 ### 4. 结果导出
 *   **全数据导出**: 将实验对比度、拟合对比度、波长/能量对应数据导出为 CSV。
@@ -78,10 +83,10 @@
 1.  **Upload Files**: 分别上传衬底和样品光谱文件。程序会自动计算实验对比度：
 
    $$
-    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}}
+    C_{exp} = C_{model} = \frac{R_{sample} - R_{sub}}{R_{sub}}
     $$
     
-    *(注: 本工具采用归一化差异定义，数值范围通常在 -1 到 1 之间*
+    *(注: 本工具采用相对于衬底反射率的差分定义。)*
 3.  **Structure Config**: 设置实验样品的物理结构（如 SiO2 厚度 285nm，是否覆盖 hBN 等）。
 4.  **Material Data**: 默认使用内置的 Si (n,k) 数据。如有特殊需求，可上传自定义的 Si 折射率文件。
 
@@ -92,7 +97,7 @@
 
 ### 4. 拟合 (Fitting)
 1.  **ROI Range**: 设置感兴趣的能量范围 (ROI Min/Max)，例如 1.5 eV - 3.0 eV。
-2.  **Method**: 选择拟合方法。推荐优先尝试 **Standard**，如果效果不佳或需要更高精度，尝试 **High Precision** 或 **Derivative**。
+2.  **Method**: 优先使用 **Robust LM**；初值不可靠时使用 **Global + Robust LM**，弱峰或重叠峰可尝试导数模式。
 3.  **Start Fitting**: 点击开始拟合。等待进度条完成。
 
 ### 5. 结果分析与导出
@@ -107,12 +112,14 @@
 *   `streamlit_app.py`: Web 版的 Python 源码（开发用，已编译进 index.html）。
 *   `materials.py`: 核心材料折射率库和处理逻辑。
 *   `Si_data.csv`: 默认的硅折射率数据源。
+*   `Schinke.csv`, `Green-2008.csv`: 可选的分段 `wl,n` / `wl,k` Si 光学常数。
+*   `example_benchmark.py`: example 全谱模型与 Si 数据源基准工具。
 
 # English Version
 
 ## Introduction
 
-This project is a professional tool designed for analyzing and fitting the **Optical Contrast** spectra of 2D materials (e.g., $\text{MoS}_2$, $\text{WS}_2$, $\text{WSe}_2$). By combining the **Transfer Matrix Method (TMM)** with the **Lorentz Oscillator Model**, it accurately extracts key optical properties (such as exciton peak positions, oscillator strengths, and broadening) from experimental reflection spectra.
+This project fits 2D-material optical-contrast spectra with a transfer-matrix model and selectable complex Faddeeva-Voigt or Lorentz oscillators.
 
 The tool offers two modes of operation:
 1.  **Web Version (Streamlit)**: Runs directly in a browser via a single HTML file (`index.html`) without complex installation. Includes a modern, user-friendly interface.
@@ -132,22 +139,27 @@ The tool offers two modes of operation:
     *   Dielectric: SiO2, hBN (Top/Bottom encapsulation).
     *   2D Material: Monolayer or few-layer samples.
 *   **Temperature Dependence**: Built-in temperature-dependent refractive index model for Silicon (10K - 300K), ideal for low-temperature spectroscopy.
-*   **Lorentz Dielectric Function**: Describes exciton absorption using the classical Lorentz oscillator model:
+*   **Finite Numerical Aperture**: Gauss-Legendre pupil integration with unpolarized s/p averaging; `NA=0` recovers normal incidence.
+*   **Controlled Interpolation**: Si uses shape-preserving PCHIP in 400--1305 nm and passive endpoint-tangent linear extrapolation outside that range.
+*   **Complex Voigt Dielectric Function (recommended)**: Faddeeva oscillators separate Lorentzian homogeneous width $w_L$ from Gaussian inhomogeneous width $w_G$; the classical Lorentz model remains available.
   
   $$  
     \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
     $$
 
 ### 3. Advanced Fitting Algorithms
-*   **Multiple Strategies**:
-    *   **Standard**: Traditional Least Squares fitting for speed.
-    *   **High Precision (Global)**: Uses Differential Evolution for global optimization to avoid local minima.
-    *   **Multi-Stage**: Sequential optimization strategy (Coarse $\rightarrow$ Medium $\rightarrow$ Fine) to improve convergence stability.
-    *   **MCMC (Basin Hopping)**: Monte Carlo Markov Chain based global optimization, effective for complex multidimensional parameter spaces.
-    *   **Derivative**: Fits the first derivative of the spectrum ($dC/dE$), significantly enhancing sensitivity to weak exciton peaks and eliminating background offsets.
-    *   **2nd Derivative**: Second-order derivative fitting for resolving fine spectral structures.
-*   **Auto-Guess**: Automatically identifies potential exciton peaks from experimental data using peak detection algorithms.
+*   **Metrology-oriented staged solver**:
+    *   **Robust LM**: bounded soft-L1 TRF localization followed by true Levenberg-Marquardt refinement through bounded parameter transforms.
+    *   **Global + Robust LM**: Differential Evolution initialization followed by robust TRF and LM.
+    *   **Derivative + LM**: warm-starts on the original spectrum, then jointly fits the spectrum and smoothed first or second energy derivative.
+*   **Joint Structure Fit**: optionally fits SiO2 and enabled top/bottom hBN thicknesses.
+*   **Variable-projection baseline**: cubic slow measurement drift is separated from nonlinear dielectric parameters.
+*   **Auto-Guess**: smoothed, detrended, noise-adaptive initialization that merges the peak/dip pair of one dispersive resonance.
 *   **Constraints & Locking**: Supports parameter bounds and locking specific parameters (e.g., fixing a known peak position) during fitting.
+*   **Fit Diagnostics**: parameter standard errors, Jacobian condition number, RMSE, reduced chi-square, and Durbin-Watson residual statistics.
+
+### Full-spectrum example acceptance
+The WS2 example automatically initializes oscillators near `2.10`, `2.50`, and `3.06 eV`. Joint SiO2-thickness fitting with a cubic slow baseline has a full-range GOF ($R^2$) regression threshold of `0.99`; all three bundled Si datasets benchmark near `0.9944`, while 4--5 oscillators reach approximately `0.996--0.997`.
 
 ### 4. Export Results
 *   **Data Export**: Download experimental vs. fitted contrast data alongside wavelength/energy as CSV.
@@ -186,7 +198,7 @@ You need two sets of experimental data:
 1.  **Upload Files**: Upload both spectra. The program calculates contrast:
 
 $$
-    C_{exp} = \frac{R_{sample} - R_{sub}}{R_{sample} + R_{sub}}
+    C_{exp} = C_{model} = \frac{R_{sample} - R_{sub}}{R_{sub}}
     $$
     
 3.  **Structure Config**: Define the physical structure (e.g., SiO2 thickness, hBN layers).
@@ -199,7 +211,7 @@ $$
 
 ### 4. Fitting
 1.  **ROI Range**: Set the energy range of interest (e.g., 1.5 eV - 3.0 eV).
-2.  **Method**: Choose a fitting strategy. Start with **Standard**, then try **High Precision** or **Derivatives** if needed.
+2.  **Method**: Start with **Robust LM**; use **Global + Robust LM** for uncertain initialization, or derivative modes for weak/overlapping peaks.
 3.  **Start Fitting**: Run the fit and wait for completion.
 
 ### 5. Analysis
@@ -212,5 +224,10 @@ $$
 *   `index.html`: Web version (contains frontend + embedded Python), single-file deployment.
 *   `gui_app.py`: Desktop application entry point (PyQt6).
 *   `streamlit_app.py`: Source code for the Web version (compiled into index.html).
+*   `optical_model.py`: TMM, Faddeeva-Voigt/Lorentz dielectric functions, finite-NA averaging, and contrast definition.
+*   `fitting_engine.py`: Robust TRF, bounded LM, baseline projection, uncertainty, and diagnostics.
+*   `sync_index.py`: Synchronizes Python sources into the standalone stlite HTML file.
 *   `materials.py`: Core material library and physics logic.
 *   `Si_data.csv`: Default Silicon refractive index data.
+*   `Schinke.csv`, `Green-2008.csv`: Optional segmented `wl,n` / `wl,k` Si optical constants.
+*   `example_benchmark.py`: Full-spectrum example and Si-source benchmark utility.

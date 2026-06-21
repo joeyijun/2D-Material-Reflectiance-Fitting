@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import numpy as np
 import pandas as pd
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -10,9 +11,21 @@ from PyQt6.QtGui import QKeySequence
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from scipy.optimize import curve_fit, differential_evolution
+from fitting_engine import (
+    FitCancelled,
+    composite_derivative_residual,
+    finalize_physical_fit,
+    fit_spectrum,
+    guess_resonances,
+)
+from optical_model import (
+    HC_EV_NM,
+    calculate_contrast_dynamic as calculate_contrast_core,
+    dielectric_func_lorentz as dielectric_func_lorentz_core,
+    dielectric_func_voigt,
+    spectral_derivative,
+)
 from scipy.interpolate import interp1d
-from tmm import coh_tmm
 
 # Import existing logic
 # Ensure the directory is in sys.path
@@ -190,6 +203,11 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, structure
     return contrast
 
 
+# Keep the UI module's public function names while using the tested core model.
+dielectric_func_lorentz = dielectric_func_lorentz_core
+calculate_contrast_dynamic = calculate_contrast_core
+
+
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi)
@@ -272,227 +290,120 @@ class FittingWorker(QThread):
 
     def run(self):
         try:
-            # 1. Filter Data by Range (x_data is nm)
-            # fit_range is in eV (min_e, max_e)
-            # x_ev = 1240/x_nm
-            x_ev_all = 1240.0 / self.x_data
-            mask = (x_ev_all >= self.fit_range[0]) & (x_ev_all <= self.fit_range[1])
-            
-            x_fit = self.x_data[mask]
-            x_fit = self.x_data[mask]
-            y_fit_exp = self.y_data[mask]
-            
-            # Derivative Mode Preparation
-            if self.fit_method == 'Derivative':
-                # Calculate dy/dx
-                y_target = np.gradient(y_fit_exp, x_fit)
-            elif self.fit_method == '2nd Derivative':
-                 # Calculate d2y/dx2
-                 y_target = np.gradient(np.gradient(y_fit_exp, x_fit), x_fit)
-            else:
-                y_target = y_fit_exp
-            
-            if len(x_fit) < 10:
+            energy_all = HC_EV_NM / self.x_data
+            mask = (energy_all >= self.fit_range[0]) & (energy_all <= self.fit_range[1])
+            wavelengths = self.x_data[mask]
+            energy = energy_all[mask]
+            measured = self.y_data[mask]
+            if wavelengths.size < 10:
                 raise ValueError("Too few points in range to fit.")
-            
-            # 2.5 Calculate Weights for Weighted Least Squares
-            # Give higher weight to regions with larger gradients (near peaks)
-            # This helps the fit focus on peak shapes rather than flat background
-            gradient_mag = np.abs(np.gradient(y_fit_exp, x_fit))
-            # Normalize and add baseline (1.0) to avoid zero weights
-            weights = 1.0 + 3.0 * (gradient_mag / (np.max(gradient_mag) + 1e-10))
-            # sigma = 1/weight for curve_fit (lower sigma = higher weight)
-            sigma_fit = 1.0 / weights
-            
-            # 2. Setup Params
-            p_unlocked0 = self.p0[~self.locked_mask]
-            b_min = np.array(self.bounds[0])[~self.locked_mask]
-            b_max = np.array(self.bounds[1])[~self.locked_mask]
-            
-            # 3. Fit Function Wrapper (supports abort)
-            def fit_func_wrapper(x, *p_unlocked):
-                if self._abort:
-                    raise RuntimeError("Fitting Stopped.")
-                
-                # Reconstruct full params
-                p_full = self.p0.copy()
-                p_full[~self.locked_mask] = p_unlocked
-                
-                # Calculate Dielectric Function (Lorentz model)
-                # Note: dielectric_func_lorentz expects eV input
-                eps_2d = dielectric_func_lorentz(1240.0/x, p_full)
-                
-                # Calculate Contrast (Vectorized)
-                y_model = calculate_contrast_dynamic(x, eps_2d, self.mat_loader, self.structure_config)
-                
-                if self.fit_method == 'Derivative':
-                    return np.gradient(y_model, x)
-                elif self.fit_method == '2nd Derivative':
-                    return np.gradient(np.gradient(y_model, x), x)
-                else:
-                    return y_model
 
-            # 4. Run Optimization
-            # Wrapper for Least Squares (residuals) or Curve Fit
-            
-            popt_unlocked = p_unlocked0
-            pcov_unlocked = None
-
-            if len(p_unlocked0) > 0:
-                # A. High Precision Global Search (Differential Evolution)
-                if self.high_precision:
-                    # DE requires bounds for all parameters. curve_fit bounds are (min_arr, max_arr).
-                    # DE requires list of (min, max) tuples.
-                    de_bounds = list(zip(b_min, b_max))
-                    
-                    # Objective function for DE: Sum of Squared Residuals
-                    def objective_de(p_current):
-                        if self._abort:
-                            return 1e10 # Penalize to stop
-                        
-                        y_pred = fit_func_wrapper(x_fit, *p_current)
-                        # Weighted residuals
-                        resid = np.sum(weights * (y_target - y_pred)**2)
-                        return resid
-
-                    # Run DE
-                    # strategy='best1bin' is standard. popsize=15 (default).
-                    res_de = differential_evolution(objective_de, de_bounds, strategy='best1bin', 
-                                                    maxiter=2000, popsize=20, tol=1e-10, atol=1e-12,
-                                                    callback=lambda xk, convergence: True if self._abort else None)
-                    
-                    if self._abort:
-                        return
-                        
-                    # Use DE result as new initial guess
-                    p_unlocked0 = res_de.x
-                
-                # B. Multi-Stage Fitting (3-stage sequential optimization)
-                elif self.fit_method == 'MultiStage':
-                    from scipy.optimize import minimize
-                    
-                    # Objective function for minimize
-                    def objective_min(p_current):
-                        if self._abort:
-                            return 1e10
-                        y_pred = fit_func_wrapper(x_fit, *p_current)
-                        return np.sum(weights * (y_target - y_pred)**2)
-                    
-                    current_p = p_unlocked0.copy()
-                    n_unlocked = len(current_p)
-                    
-                    # Determine parameter types for staging
-                    # params order after eps_inf: [f1, E01, g1, f2, E02, g2, ...]
-                    # For staging, we need to know which indices are E0, f, gamma
-                    # eps_inf is index 0 in full params, so unlocked indices start from there
-                    
-                    # Create masks for different param types (relative to unlocked)
-                    # This is complex because locked params shift indices
-                    # Simplified: fit all together but in stages with tighter bounds
-                    
-                    bounds_list = list(zip(b_min, b_max))
-                    
-                    # Stage 1: Coarse fit with relaxed tolerance
-                    res1 = minimize(objective_min, current_p, method='L-BFGS-B',
-                                   bounds=bounds_list, options={'maxiter': 500, 'ftol': 1e-6})
-                    if self._abort: return
-                    current_p = res1.x
-                    
-                    # Stage 2: Medium precision
-                    res2 = minimize(objective_min, current_p, method='L-BFGS-B',
-                                   bounds=bounds_list, options={'maxiter': 1000, 'ftol': 1e-9})
-                    if self._abort: return
-                    current_p = res2.x
-                    
-                    # Stage 3: High precision final fit
-                    res3 = minimize(objective_min, current_p, method='L-BFGS-B',
-                                   bounds=bounds_list, options={'maxiter': 2000, 'ftol': 1e-12})
-                    if self._abort: return
-                    
-                    p_unlocked0 = res3.x
-                
-                # C. MCMC / Basin Hopping for robust global search
-                elif self.fit_method == 'MCMC':
-                    from scipy.optimize import basinhopping, minimize
-                    
-                    def objective_min(p_current):
-                        if self._abort:
-                            return 1e10
-                        # Clip to bounds
-                        p_clipped = np.clip(p_current, b_min, b_max)
-                        y_pred = fit_func_wrapper(x_fit, *p_clipped)
-                        return np.sum(weights * (y_target - y_pred)**2)
-                    
-                    bounds_list = list(zip(b_min, b_max))
-                    
-                    # Custom step function to respect bounds
-                    class BoundedStep:
-                        def __init__(self, stepsize=0.1):
-                            self.stepsize = stepsize
-                        def __call__(self, x):
-                            s = self.stepsize
-                            x_new = x + np.random.uniform(-s, s, x.shape)
-                            # Clip to bounds
-                            x_new = np.clip(x_new, b_min, b_max)
-                            return x_new
-                    
-                    # Run Basin Hopping (MCMC-like global optimizer)
-                    minimizer_kwargs = {
-                        'method': 'L-BFGS-B',
-                        'bounds': bounds_list,
-                        'options': {'ftol': 1e-10, 'maxiter': 500}
-                    }
-                    
-                    # Callback to check abort
-                    def bh_callback(x, f, accept):
-                        return self._abort  # Return True to stop
-                    
-                    res_bh = basinhopping(objective_min, p_unlocked0, 
-                                         minimizer_kwargs=minimizer_kwargs,
-                                         niter=50, T=1.0,
-                                         take_step=BoundedStep(0.05),
-                                         callback=bh_callback)
-                    
-                    if self._abort: return
-                    p_unlocked0 = res_bh.x
-                
-                # D. Local Refinement (Curve Fit / Levenberg-Marquardt / TRF)
-                # Even after global search, run curve_fit to get covariance and fine-tune
-                # Use weighted fitting: sigma = 1/weight (lower sigma = higher importance)
-                popt_unlocked, pcov_unlocked = curve_fit(fit_func_wrapper, x_fit, y_target, 
-                                                         p0=p_unlocked0, bounds=(b_min, b_max),
-                                                         sigma=sigma_fit, absolute_sigma=True,
-                                                         ftol=1e-12, xtol=1e-12, gtol=1e-12,
-                                                         maxfev=10000)
-                # Reconstruct
-                popt_full = self.p0.copy()
-                popt_full[~self.locked_mask] = popt_unlocked
+            derivative_order = {
+                'Derivative': 1,
+                '2nd Derivative': 2,
+            }.get(self.fit_method, 0)
+            if derivative_order:
+                objective_energy = np.tile(energy, derivative_order + 1)
+                target = np.zeros(objective_energy.size)
             else:
-                popt_full = self.p0 # Nothing to fit
-            
-            if self._abort:
-                 return
+                objective_energy = energy
+                target = measured
 
-            # 5. Result Calculation
-            # Calculate full range result for plotting
-            eps_full = dielectric_func_lorentz(1240.0/self.x_data, popt_full)
-            y_fit_full = calculate_contrast_dynamic(self.x_data, eps_full, 
-                                                    self.mat_loader, self.structure_config)
-            
-            # 6. Calculate Goodness of Fit (R-squared)
-            ss_res = np.sum((y_fit_exp - calculate_contrast_dynamic(x_fit, dielectric_func_lorentz(1240.0/x_fit, popt_full), self.mat_loader, self.structure_config))**2)
-            ss_tot = np.sum((y_fit_exp - np.mean(y_fit_exp))**2)
-            r_squared = 1 - (ss_res / ss_tot)
-            
-            self.finished.emit(y_fit_full, popt_full, r_squared)
-            
-        except RuntimeError as re:
-            if "Stopped" in str(re):
-                self.aborted.emit()
-                return
-            self.error.emit(str(re))
-        except Exception as e:
-            self.error.emit(str(e))
+            physical_count = self.p0.size
+            structure_parameters = []
+            if (self.structure_config.get('substrate_type') == 'Si/SiO2'
+                    and self.structure_config.get('fit_sio2_thickness', False)):
+                value = float(self.structure_config['sio2_thick'])
+                structure_parameters.append(('sio2_thick', value, max(0.0, value - 20.0), value + 20.0))
+            if self.structure_config.get('fit_hbn_thickness', False):
+                for enabled_key, thickness_key in (
+                    ('has_top_hbn', 'top_hbn_thick'), ('has_bot_hbn', 'bot_hbn_thick')
+                ):
+                    if self.structure_config.get(enabled_key, False):
+                        value = float(self.structure_config[thickness_key])
+                        structure_parameters.append((thickness_key, value, 0.0, 100.0))
+            fit_initial = self.p0.copy()
+            fit_lower = np.asarray(self.bounds[0], dtype=float)
+            fit_upper = np.asarray(self.bounds[1], dtype=float)
+            fit_locked = self.locked_mask.copy()
+            for _, value, lower, upper in structure_parameters:
+                fit_initial = np.append(fit_initial, value)
+                fit_lower = np.append(fit_lower, lower)
+                fit_upper = np.append(fit_upper, upper)
+                fit_locked = np.append(fit_locked, False)
+
+            dielectric_model = (
+                dielectric_func_voigt
+                if self.structure_config.get('line_shape') == 'Voigt'
+                else dielectric_func_lorentz
+            )
+
+            def physical_model(params):
+                model_config = self.structure_config.copy()
+                for offset, (key, _, _, _) in enumerate(structure_parameters):
+                    model_config[key] = params[physical_count + offset]
+                epsilon = dielectric_model(energy, params[:physical_count])
+                return calculate_contrast_dynamic(
+                    wavelengths, epsilon, self.mat_loader, model_config
+                )
+
+            def model(params):
+                contrast = physical_model(params)
+                if derivative_order:
+                    return composite_derivative_residual(
+                        measured, contrast, energy, maximum_order=derivative_order
+                    )
+                return contrast
+
+            if derivative_order:
+                warm_result = fit_spectrum(
+                    energy, measured, physical_model, fit_initial,
+                    (fit_lower, fit_upper), fit_locked, baseline_order=3,
+                    robust=True, global_search=self.high_precision,
+                    cancel_check=lambda: self._abort, max_nfev=6000,
+                )
+                fit_initial = warm_result.params
+
+            result = fit_spectrum(
+                objective_energy,
+                target,
+                model,
+                fit_initial,
+                (fit_lower, fit_upper),
+                fit_locked,
+                baseline_order=-1 if derivative_order else 3,
+                robust=True,
+                global_search=self.high_precision and not derivative_order,
+                sigma=np.ones_like(target) if derivative_order else None,
+                cancel_check=lambda: self._abort,
+                max_nfev=10000,
+            )
+            if not result.success:
+                raise RuntimeError(result.message)
+            self.fit_result = result
+            fitted_config = self.structure_config.copy()
+            self.fitted_structure = {}
+            for offset, (key, _, _, _) in enumerate(structure_parameters):
+                value = float(result.params[physical_count + offset])
+                self.fitted_structure[key] = value
+                fitted_config[key] = value
+
+            physical_params = result.params[:physical_count]
+            epsilon_roi = dielectric_model(energy, physical_params)
+            physical_roi = calculate_contrast_dynamic(
+                wavelengths, epsilon_roi, self.mat_loader, fitted_config
+            )
+            finalize_physical_fit(result, energy, measured, physical_roi, baseline_order=3)
+            epsilon_full = dielectric_model(energy_all, physical_params)
+            physical_full = calculate_contrast_dynamic(
+                self.x_data, epsilon_full, self.mat_loader, fitted_config
+            )
+            fitted_full = result.add_baseline(physical_full, energy_all)
+            self.finished.emit(fitted_full, physical_params, result.r_squared)
+        except FitCancelled:
+            self.aborted.emit()
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -569,6 +480,12 @@ class MainWindow(QMainWindow):
         self.combo_sub = QComboBox()
         self.combo_sub.addItems(["Si/SiO2", "Quartz", "Sapphire", "TiO2"])
         self.combo_sub.currentIndexChanged.connect(self.on_substrate_changed)
+
+        self.combo_si_data = QComboBox()
+        for filename in ("Si_data.csv", "Schinke.csv", "Green-2008.csv"):
+            if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)):
+                self.combo_si_data.addItem(filename)
+        self.combo_si_data.currentTextChanged.connect(self.on_si_data_changed)
         
         # --- Helper for Row with Unit ---
         def create_unit_spinbox(spin: QDoubleSpinBox, unit: str):
@@ -586,13 +503,25 @@ class MainWindow(QMainWindow):
         self.spin_sio2.setRange(0, 1000)
         self.spin_sio2.setValue(285.0)
         self.container_sio2 = create_unit_spinbox(self.spin_sio2, "nm")
+        self.chk_fit_sio2 = QCheckBox("Fit SiO2 thickness (+/-20 nm)")
+        self.chk_fit_sio2.setChecked(True)
         
         # Temp
         self.lbl_temp = QLabel("Temperature:")
         self.spin_temp = QDoubleSpinBox()
-        self.spin_temp.setRange(0, 1000)
+        self.spin_temp.setRange(10, 300)
         self.spin_temp.setValue(298.0)
         self.container_temp = create_unit_spinbox(self.spin_temp, "K")
+
+        self.spin_na = QDoubleSpinBox()
+        self.spin_na.setRange(0.0, 0.95)
+        self.spin_na.setDecimals(2)
+        self.spin_na.setSingleStep(0.05)
+        self.spin_na.setValue(0.0)
+        self.spin_na.setToolTip(
+            "Effective filled-pupil illumination NA. Change requires refitting; 0 is normal incidence."
+        )
+        self.spin_na.valueChanged.connect(self.on_na_changed)
         
         # Top hBN
         self.chk_top_hbn = QCheckBox("Top hBN")
@@ -607,6 +536,7 @@ class MainWindow(QMainWindow):
         self.spin_bot_hbn.setRange(0, 200)
         self.spin_bot_hbn.setValue(10.0)
         container_bot = create_unit_spinbox(self.spin_bot_hbn, "nm")
+        self.chk_fit_hbn = QCheckBox("Fit enabled hBN thicknesses (0-100 nm)")
         
         # Sample Thickness
         self.spin_2d = QDoubleSpinBox()
@@ -617,15 +547,19 @@ class MainWindow(QMainWindow):
 
         # Eps inf
         self.spin_eps_inf = QDoubleSpinBox()
-        self.spin_eps_inf.setRange(0, 50)
+        self.spin_eps_inf.setRange(1, 50)
         self.spin_eps_inf.setValue(12.0)
         
         form_struct.addRow("Substrate:", self.combo_sub)
+        form_struct.addRow("Si optical data:", self.combo_si_data)
         form_struct.addRow(self.lbl_sio2, self.container_sio2)
+        form_struct.addRow("", self.chk_fit_sio2)
         form_struct.addRow(self.lbl_temp, self.container_temp)
+        form_struct.addRow("Illumination NA:", self.spin_na)
         form_struct.addRow(self.chk_top_hbn, container_top)
         form_struct.addRow("Sample Thickness:", container_2d)
         form_struct.addRow(self.chk_bot_hbn, container_bot)
+        form_struct.addRow("", self.chk_fit_hbn)
         form_struct.addRow("Background Eps:", self.spin_eps_inf)
         
         group_struct.setLayout(form_struct)
@@ -650,23 +584,33 @@ class MainWindow(QMainWindow):
         layout_opt.addWidget(self.spin_range_max)
         
         self.combo_fit_method = QComboBox()
-        self.combo_fit_method.addItems(["Standard", "High Precision", "Multi-Stage", "MCMC", "1st Derivative", "2nd Derivative"])
+        self.combo_fit_method.addItems([
+            "Robust LM (Recommended)",
+            "Global + Robust LM",
+            "1st Derivative + LM",
+            "2nd Derivative + LM",
+        ])
         layout_opt.addWidget(QLabel("Method:"))
         layout_opt.addWidget(self.combo_fit_method)
+
+        self.combo_line_shape = QComboBox()
+        self.combo_line_shape.addItems(["Voigt / Faddeeva (Recommended)", "Lorentz"])
+        layout_opt.addWidget(QLabel("Line shape:"))
+        layout_opt.addWidget(self.combo_line_shape)
         
         group_opt.setLayout(layout_opt)
         layout.addWidget(group_opt)
         
         # --- Excitons ---
-        group_excitons = QGroupBox("Excitons (Lorentz Model)")
+        group_excitons = QGroupBox("Excitons")
         vbox_exc = QVBoxLayout()
         
         # Update Table Columns: f, Lock, E0, Lock, G, Lock (Interleaved)
-        self.table_exc = CopyableTableWidget(0, 6)
-        self.table_exc.setHorizontalHeaderLabels(["f", "🔒", "E0", "🔒", "Gamma", "🔒"])
+        self.table_exc = CopyableTableWidget(0, 8)
+        self.table_exc.setHorizontalHeaderLabels(["f", "Lock", "E0", "Lock", "wL", "Lock", "wG", "Lock"])
         self.table_exc.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         # Resize lock columns to be small
-        for c in [1,3,5]:
+        for c in [1,3,5,7]:
             self.table_exc.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             self.table_exc.setColumnWidth(c, 30)
         
@@ -738,9 +682,22 @@ class MainWindow(QMainWindow):
         
         self.lbl_sio2.setVisible(is_si)
         self.container_sio2.setVisible(is_si)
+        self.combo_si_data.setVisible(is_si)
+        self.chk_fit_sio2.setVisible(is_si)
         
         self.lbl_temp.setVisible(is_si)
         self.container_temp.setVisible(is_si)
+
+    def on_si_data_changed(self, filename):
+        if not filename:
+            return
+        self.si_data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        self.init_materials()
+
+    def on_na_changed(self, _value):
+        if getattr(self, 'last_y_fit', None) is not None:
+            self.status_label.setText("Illumination NA changed - run fitting again.")
+            self.status_label.setStyleSheet("color: darkorange")
 
     def on_mouse_move(self, event):
         if not event.inaxes: 
@@ -791,37 +748,33 @@ class MainWindow(QMainWindow):
         if x_ev is None or len(x_ev) == 0:
             return
 
-        from scipy.signal import find_peaks
-        # Use abs(contrast) to capture dips or peaks
-        # Smooth slightly?
-        # Simple detection first
-        peaks, _ = find_peaks(np.abs(y_contrast), prominence=0.01, distance=5)
+        roi = (x_ev >= self.spin_range_min.value()) & (x_ev <= self.spin_range_max.value())
+        guesses = guess_resonances(x_ev[roi], y_contrast[roi])
         
-        if len(peaks) == 0:
+        if len(guesses) == 0:
             QMessageBox.information(self, "Info", "No significant peaks found.")
             return
 
         # Ask user confirmation? No, just populate (easy to remove)
-        reply = QMessageBox.question(self, "Auto-Guess", f"Found {len(peaks)} peaks. Replace existing excitons?", 
+        reply = QMessageBox.question(self, "Auto-Guess", f"Found {len(guesses)} peaks. Replace existing excitons?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
         if reply == QMessageBox.StandardButton.Yes:
             self.table_exc.setRowCount(0)
-            for p in peaks:
-                val_E = x_ev[p]
-                # Default guess: f=0.1, gamma=0.05. Smart guess for gamma (FWHM) is harder without peak analysis.
-                self.add_exciton_values(0.1, round(val_E, 4), 0.05)
+            for energy, linewidth in guesses:
+                self.add_exciton_values(0.1, round(energy, 4), round(linewidth, 4))
 
-    def add_exciton_values(self, f, E0, gamma, locks=(False, False, False)):
+    def add_exciton_values(self, f, E0, gamma, gaussian=0.01, locks=(False, False, False, False)):
         row = self.table_exc.rowCount()
         self.table_exc.insertRow(row)
         # Values in 0, 2, 4
         self.table_exc.setItem(row, 0, QTableWidgetItem(str(f)))
         self.table_exc.setItem(row, 2, QTableWidgetItem(str(E0)))
         self.table_exc.setItem(row, 4, QTableWidgetItem(str(gamma)))
+        self.table_exc.setItem(row, 6, QTableWidgetItem(str(gaussian)))
         
         # Add Checkboxes for locks in 1, 3, 5
-        for i, col in enumerate([1, 3, 5]):
+        for i, col in enumerate([1, 3, 5, 7]):
            # Create a widget to center the checkbox
            cell_widget = QWidget()
            chk = QCheckBox()
@@ -853,12 +806,24 @@ class MainWindow(QMainWindow):
         if path:
             self.sub_path = path
             self.btn_sub.setText(f"Substrate: {os.path.basename(path)}")
+            self._infer_sio2_thickness_from_filename(path)
     
     def load_sample(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Sample File", "", "Data Files (*.csv *.txt *.dat);;All Files (*)")
         if path:
             self.samp_path = path
             self.btn_samp.setText(f"Sample: {os.path.basename(path)}")
+            self._infer_sio2_thickness_from_filename(path)
+
+    def _infer_sio2_thickness_from_filename(self, path):
+        filename = os.path.basename(path)
+        match = re.search(r"(\d+(?:\.\d+)?)\s*nm\s*SiO2", filename, re.IGNORECASE)
+        if match:
+            self.spin_sio2.setValue(float(match.group(1)))
+        if len(re.findall(r"hBN", filename, re.IGNORECASE)) >= 2:
+            self.chk_top_hbn.setChecked(True)
+            self.chk_bot_hbn.setChecked(True)
+            self.chk_fit_hbn.setChecked(True)
             
     def get_processed_data(self):
         """Helper to load and process data returning (x_ev, y_contrast)"""
@@ -875,7 +840,7 @@ class MainWindow(QMainWindow):
         # Helper to standardize to nm
         def to_nm(x, y):
              if np.mean(x) < 100: # Assume eV input
-                 wl = 1240.0 / x
+                 wl = HC_EV_NM / x
                  # Sort because inverse relationship flips order
                  idx = np.argsort(wl)
                  return wl[idx], y[idx]
@@ -899,10 +864,17 @@ class MainWindow(QMainWindow):
             samp_final = int_samp_interp[mask]
             
             # Calculate Contrast
-            y_contrast_exp = (samp_final - sub_final) / (samp_final + sub_final)
+            substrate_is_unit_placeholder = (
+                np.ptp(sub_final) <= 1e-8 and np.allclose(sub_final, 1.0, atol=1e-8)
+                and np.any(samp_final < 0)
+            )
+            y_contrast_exp = (
+                samp_final if substrate_is_unit_placeholder
+                else (samp_final - sub_final) / sub_final
+            )
             
             # Convert back to eV for output
-            x_ev = 1240.0 / wl_final
+            x_ev = HC_EV_NM / wl_final
             
             # Sort by Energy (Low -> High) for plotting convenience
             idx_ev = np.argsort(x_ev)
@@ -1012,7 +984,7 @@ class MainWindow(QMainWindow):
             return
             
         # Recover wavelength for fitting because TMM needs nm
-        x_exp_nm = 1240.0 / x_ev
+        x_exp_nm = HC_EV_NM / x_ev
             
         # UI State -> Fitting
         self.btn_fit.setText("Stop Fitting")
@@ -1027,27 +999,28 @@ class MainWindow(QMainWindow):
             fit_method = 'Standard'
             high_prec = False
             
-            if method_str == "High Precision":
+            if method_str == "Global + Robust LM":
                 fit_method = 'Standard'
                 high_prec = True
-            elif method_str == "Multi-Stage":
-                fit_method = 'MultiStage'
-            elif method_str == "MCMC":
-                fit_method = 'MCMC'
-            elif method_str == "1st Derivative":
+            elif method_str == "1st Derivative + LM":
                 fit_method = 'Derivative'
-            elif method_str == "2nd Derivative":
+            elif method_str == "2nd Derivative + LM":
                 fit_method = '2nd Derivative'
             
             struct_config = {
                 'substrate_type': self.combo_sub.currentText(),
                 'sio2_thick': self.spin_sio2.value(),
+                'fit_sio2_thickness': self.chk_fit_sio2.isChecked(),
                 'temp': self.spin_temp.value(),
+                'numerical_aperture': self.spin_na.value(),
                 'sample_thick': self.spin_2d.value(),
                 'has_top_hbn': self.chk_top_hbn.isChecked(),
                 'top_hbn_thick': self.spin_top_hbn.value(),
                 'has_bot_hbn': self.chk_bot_hbn.isChecked(),
                 'bot_hbn_thick': self.spin_bot_hbn.value(),
+                'fit_hbn_thickness': self.chk_fit_hbn.isChecked(),
+                'contrast_definition': 'relative',
+                'line_shape': 'Voigt' if self.combo_line_shape.currentIndex() == 0 else 'Lorentz',
                 'fit_method': fit_method,
                 'high_precision': high_prec
             }
@@ -1069,14 +1042,21 @@ class MainWindow(QMainWindow):
                     f = float(self.table_exc.item(r, 0).text())
                     E0 = float(self.table_exc.item(r, 2).text())
                     g = float(self.table_exc.item(r, 4).text())
-                    p0.extend([f, E0, g])
+                    if struct_config['line_shape'] == 'Voigt':
+                        wg = float(self.table_exc.item(r, 6).text())
+                        p0.extend([f, E0, g, wg])
+                    else:
+                        p0.extend([f, E0, g])
                     
                     # Check Locks at 1, 3, 5
                     lock_f = self._get_lock_state(r, 1)
                     lock_E0 = self._get_lock_state(r, 3)
                     lock_g = self._get_lock_state(r, 5)
                     
-                    locked_mask.extend([lock_f, lock_E0, lock_g])
+                    locks = [lock_f, lock_E0, lock_g]
+                    if struct_config['line_shape'] == 'Voigt':
+                        locks.append(self._get_lock_state(r, 7))
+                    locked_mask.extend(locks)
                     
                 except ValueError:
                      QMessageBox.warning(self, "Warning", f"Invalid number in Exciton Row {r+1}. Skipping.")
@@ -1090,8 +1070,7 @@ class MainWindow(QMainWindow):
             # 4b. Construct Bounds
             # p0 structure: [eps_inf, f1, E01, g1, f2, E02, g2, ...]
             # Bounds need to match unlocked parameters only? 
-            # No, scipy.optimize.curve_fit expects bounds for ALL parameters if p0 is full, or subset if p0 is subset.
-            # Here we pass full bounds (min, max) to worker, and worker slices them.
+            # Bounds are supplied for the full vector; the engine removes locked parameters.
             
             bounds_min = []
             bounds_max = []
@@ -1101,7 +1080,8 @@ class MainWindow(QMainWindow):
             bounds_max.append(50.0)
             
             # Oscillators
-            num_osc = (len(p0) - 1) // 3
+            stride = 4 if struct_config['line_shape'] == 'Voigt' else 3
+            num_osc = (len(p0) - 1) // stride
             
             # Global Bounds Logic:
             # Prioritize user-specified exciton peak positions by using TIGHT bounds around E0.
@@ -1119,8 +1099,8 @@ class MainWindow(QMainWindow):
                 except:
                     user_E0_values.append(2.0)  # Fallback
             
-            # Tight E0 margin (±0.15 eV) to prioritize user settings
-            E0_margin = 0.15
+            # Tight E0 margin (+/-0.15 eV) to prioritize user settings
+            E0_margin = 0.02
             
             for i in range(num_osc):
                 # f: 0 to 20
@@ -1135,6 +1115,9 @@ class MainWindow(QMainWindow):
                 # Gamma: 0.0001 to 0.5 eV (Prevent singular or too broad)
                 bounds_min.append(0.0001)
                 bounds_max.append(0.5)
+                if stride == 4:
+                    bounds_min.append(0.0001)
+                    bounds_max.append(0.5)
             
             # 5. Fit Range
             fit_range = (self.spin_range_min.value(), self.spin_range_max.value())
@@ -1162,7 +1145,7 @@ class MainWindow(QMainWindow):
         self.btn_fit.setStyleSheet("") # Reset Color
         
         # Convert Wavelength (nm) to Energy (eV)
-        x_ev = 1240.0 / x_data
+        x_ev = HC_EV_NM / x_data
         
         # Update Plot
         self.canvas.axes.cla()
@@ -1189,6 +1172,14 @@ class MainWindow(QMainWindow):
         self.last_x_ev = x_ev
         self.last_y_exp = y_data
         self.last_y_fit = y_fit
+        self.last_fit_result = getattr(self.worker, 'fit_result', None)
+        fitted_structure = getattr(self.worker, 'fitted_structure', {})
+        if 'sio2_thick' in fitted_structure:
+            self.spin_sio2.setValue(fitted_structure['sio2_thick'])
+        if 'top_hbn_thick' in fitted_structure:
+            self.spin_top_hbn.setValue(fitted_structure['top_hbn_thick'])
+        if 'bot_hbn_thick' in fitted_structure:
+            self.spin_bot_hbn.setValue(fitted_structure['bot_hbn_thick'])
         
         # Update UI with results
         # popt[0] is eps_inf
@@ -1196,21 +1187,44 @@ class MainWindow(QMainWindow):
         
         # Update Table
         self.table_exc.setRowCount(0) # Clear
-        num_oscillators = (len(popt) - 1) // 3
+        stride = 4 if self.worker.structure_config.get('line_shape') == 'Voigt' else 3
+        num_oscillators = (len(popt) - 1) // stride
         for i in range(num_oscillators):
-            f = popt[1 + i*3]
-            E0 = popt[2 + i*3]
-            gamma = popt[3 + i*3]
+            base = 1 + i * stride
+            f, E0, gamma = popt[base:base + 3]
+            gaussian = popt[base + 3] if stride == 4 else 0.01
             
             # Restore locks
             # Indices in locked_mask (which includes eps at 0): 1+i*3, 2+i*3, 3+i*3
-            l_f = locked_mask[1 + i*3]
-            l_E0 = locked_mask[2 + i*3]
-            l_g = locked_mask[3 + i*3]
+            l_f, l_E0, l_g = locked_mask[base:base + 3]
+            l_wg = locked_mask[base + 3] if stride == 4 else False
             
-            self.add_exciton_values(round(f, 4), round(E0, 4), round(gamma, 4), locks=(l_f, l_E0, l_g))
+            self.add_exciton_values(round(f, 4), round(E0, 4), round(gamma, 4), round(gaussian, 4), locks=(l_f, l_E0, l_g, l_wg))
         
+        result = self.last_fit_result
         msg = f"Fitting completed successfully!\nR-squared: {r_squared:.4f}"
+        if result is not None:
+            msg += (
+                f"\nRMSE: {result.rmse:.6g}"
+                f"\nOptimizer: {result.method}"
+                f"\nJacobian condition: {result.jacobian_condition:.3g}"
+                f"\nDurbin-Watson: {result.durbin_watson:.3f}"
+            )
+            if result.jacobian_condition > 1e10:
+                msg += "\n\nWarning: parameters are strongly correlated; reported values may not be identifiable."
+            for offset, (key, value) in enumerate(fitted_structure.items()):
+                error_index = len(popt) + offset
+                msg += f"\n{key} = {value:.4f} +/- {result.standard_errors[error_index]:.2g} nm"
+            msg += f"\nEps_inf = {popt[0]:.5g} +/- {result.standard_errors[0]:.2g}"
+            for i in range((len(popt) - 1) // stride):
+                base = 1 + stride * i
+                msg += (
+                    f"\nPeak {i + 1}: E0 = {popt[base + 1]:.6g} +/- "
+                    f"{result.standard_errors[base + 1]:.2g} eV, Gamma = "
+                    f"{popt[base + 2]:.5g} +/- {result.standard_errors[base + 2]:.2g} eV"
+                )
+                if stride == 4:
+                    msg += f", wG = {popt[base + 3]:.5g} +/- {result.standard_errors[base + 3]:.2g} eV"
         if r_squared < 0.9:
             msg += "\n\nWarning: Low fit quality. Please check initial guesses or range."
             QMessageBox.warning(self, "Fitting Result", msg)

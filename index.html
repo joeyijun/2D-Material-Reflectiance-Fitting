@@ -16,11 +16,25 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-from scipy.optimize import curve_fit, differential_evolution, minimize, basinhopping
-from scipy.interpolate import interp1d
+from fitting_engine import (
+    composite_derivative_residual,
+    finalize_physical_fit,
+    fit_spectrum,
+    guess_resonances,
+)
+from materials import read_si_optical_constants
+from optical_model import (
+    HC_EV_NM,
+    calculate_contrast_dynamic as calculate_contrast_core,
+    dielectric_func_lorentz as dielectric_func_lorentz_core,
+    dielectric_func_voigt,
+    spectral_derivative,
+)
+from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 import os
+import re
 import sys
 
 # --- Material Loader Class (Adapted) ---
@@ -28,7 +42,7 @@ class MaterialLoader:
     def __init__(self, si_filename=None, uploaded_si_file=None):
         self.si_n_interp = None
         self.si_k_interp = None
-        
+
         # Priority: Uploaded > Local Default
         if uploaded_si_file is not None:
              self._init_si_interpolation_from_file(uploaded_si_file)
@@ -41,32 +55,60 @@ class MaterialLoader:
 
     def _init_si_interpolation_from_path(self, path):
         try:
-            df = pd.read_csv(path, header=None, names=['lam_um', 'n', 'k'])
-            self._process_data(df)
+            self._process_data(path)
         except Exception as e:
             st.error(f"Error loading substrate file: {e}")
 
     def _init_si_interpolation_from_file(self, uploaded_file):
         try:
-            df = pd.read_csv(uploaded_file, header=None, names=['lam_um', 'n', 'k'])
-            self._process_data(df)
+            self._process_data(uploaded_file)
         except Exception as e:
              st.error(f"Error loading uploaded substrate file: {e}")
 
-    def _process_data(self, df):
-        lam_nm = df['lam_um'].values * 1000.0
-        n_vals = df['n'].values
-        k_vals = df['k'].values
-        self.si_n_interp = interp1d(lam_nm, n_vals, kind='cubic', fill_value="extrapolate")
-        self.si_k_interp = interp1d(lam_nm, k_vals, kind='cubic', fill_value="extrapolate")
+    def _process_data(self, source):
+        lam_nm, n_vals, k_vals = read_si_optical_constants(source)
+        order = np.argsort(lam_nm)
+        lam_nm = lam_nm[order]
+        self.si_wavelength_range = (float(lam_nm[0]), float(lam_nm[-1]))
+        self.si_n_interp = PchipInterpolator(lam_nm, n_vals[order], extrapolate=False)
+        self.si_k_interp = PchipInterpolator(lam_nm, k_vals[order], extrapolate=False)
+        self.si_n_edge_slopes = tuple(
+            float(self.si_n_interp.derivative()(edge)) for edge in self.si_wavelength_range
+        )
+        self.si_k_edge_slopes = tuple(
+            float(self.si_k_interp.derivative()(edge)) for edge in self.si_wavelength_range
+        )
+
+    def _evaluate_si_component(self, wavelengths_nm, interpolation, edge_slopes):
+        lower, upper = self.si_wavelength_range
+        clipped = np.clip(wavelengths_nm, lower, upper)
+        values = interpolation(clipped)
+        lower_value = float(interpolation(lower))
+        upper_value = float(interpolation(upper))
+        values = np.where(
+            wavelengths_nm < lower,
+            lower_value + edge_slopes[0] * (wavelengths_nm - lower),
+            values,
+        )
+        return np.where(
+            wavelengths_nm > upper,
+            upper_value + edge_slopes[1] * (wavelengths_nm - upper),
+            values,
+        )
 
     def get_si_n(self, lam_nm):
         if self.si_n_interp is None: return 1.0 + 0j
-        n = self.si_n_interp(lam_nm)
-        k = self.si_k_interp(lam_nm)
-        return n + 1j * k
+        lam_nm = np.asarray(lam_nm, dtype=float)
+        if np.any(~np.isfinite(lam_nm)) or np.any(lam_nm <= 0):
+            raise ValueError("Si wavelengths must be finite and positive")
+        n = self._evaluate_si_component(lam_nm, self.si_n_interp, self.si_n_edge_slopes)
+        k = self._evaluate_si_component(lam_nm, self.si_k_interp, self.si_k_edge_slopes)
+        n = np.maximum(n, np.finfo(float).eps)
+        return n + 1j * np.maximum(k, 0.0)
 
     def get_si_n_with_temp(self, lam_nm, temp_k):
+        if not 10.0 <= temp_k <= 300.0:
+            raise ValueError("Si temperature correction is calibrated only for 10-300 K")
         n_base = self.get_si_n(lam_nm)
         lam_um = lam_nm / 1000.0
         delta_n_abs = 0.02514 + 0.00850 / (lam_um**2 - 0.10165)
@@ -75,11 +117,7 @@ class MaterialLoader:
         correction_n = ratio * delta_n_abs
         correction_k = ratio * delta_k_abs
         n_real = np.real(n_base) - correction_n
-        n_imag = np.imag(n_base) - correction_k
-        if np.isscalar(n_imag):
-            if n_imag < 0: n_imag = 0
-        else:
-            n_imag[n_imag < 0] = 0
+        n_imag = np.maximum(np.imag(n_base) - correction_k, 0.0)
         return n_real + 1j * n_imag
 
     def get_sio2_n(self, lam_nm):
@@ -130,10 +168,10 @@ def dielectric_func_lorentz(E, params):
 def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, structure_config):
     lam_arr = np.array(wavelengths_nm)
     n_2d_arr = np.sqrt(eps_sample)
-    
+
     sub_type = structure_config.get('substrate_type', 'Si/SiO2')
     temp_k = structure_config.get('temp', 298.0)
-    
+
     if sub_type == 'Si/SiO2':
         n_sub_arr = mat_loader.get_si_n_with_temp(lam_arr, temp_k)
         n_oxide_arr = mat_loader.get_sio2_n(lam_arr)
@@ -146,35 +184,35 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, structure
     elif sub_type == 'Sapphire':
         n_sub_arr = mat_loader.get_sapphire_n(lam_arr)
         n_oxide_arr = None
-    
+
     n_hbn_val = mat_loader.get_hbn_n(lam_arr)
     if np.isscalar(n_hbn_val):
         n_hbn_arr = np.full_like(lam_arr, n_hbn_val, dtype=complex)
     else:
         n_hbn_arr = n_hbn_val
-        
+
     def solve_stack(include_sample, include_hbn):
         stack_n = []
         stack_d = []
-        
+
         if include_hbn and structure_config['has_top_hbn']:
             stack_n.append(n_hbn_arr)
             stack_d.append(structure_config['top_hbn_thick'])
-            
+
         if include_sample:
             stack_n.append(n_2d_arr)
             stack_d.append(structure_config['sample_thick'])
-            
+
         if include_hbn and structure_config['has_bot_hbn']:
             stack_n.append(n_hbn_arr)
             stack_d.append(structure_config['bot_hbn_thick'])
-            
+
         if n_oxide_arr is not None:
              stack_n.append(n_oxide_arr)
              stack_d.append(structure_config['sio2_thick'])
-             
+
         M = np.broadcast_to(np.eye(2, dtype=complex), (len(lam_arr), 2, 2)).copy()
-        
+
         for n_layer, d_layer in zip(stack_n, stack_d):
             delta = 2 * np.pi * n_layer * d_layer / lam_arr
             cos_d = np.cos(delta)
@@ -183,12 +221,12 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, structure
             m12 = -1j / n_layer * sin_d
             m21 = -1j * n_layer * sin_d
             m22 = cos_d
-            M_layer = np.array([[m11, m12], [m21, m22]]) 
-            M_layer = np.moveaxis(M_layer, 2, 0) 
+            M_layer = np.array([[m11, m12], [m21, m22]])
+            M_layer = np.moveaxis(M_layer, 2, 0)
             M = np.matmul(M, M_layer)
-            
+
         n_s = n_sub_arr
-        n_0 = 1.0 
+        n_0 = 1.0
         M11 = M[:, 0, 0]
         M12 = M[:, 0, 1]
         M21 = M[:, 1, 0]
@@ -198,7 +236,7 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, structure
         Y = (M21 + M22 * n_s) / denom
         r = (n_0 - Y) / (n_0 + Y)
         return np.abs(r)**2
-    
+
     try:
         R_sample = solve_stack(include_sample=True, include_hbn=True)
         R_ref = solve_stack(include_sample=False, include_hbn=False)
@@ -206,7 +244,11 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, structure
         contrast = (R_sample - R_ref) / R_ref
         return contrast
     except Exception as e:
-        return np.zeros_like(lam_arr)
+        raise RuntimeError("Optical model calculation failed") from e
+
+
+dielectric_func_lorentz = dielectric_func_lorentz_core
+calculate_contrast_dynamic = calculate_contrast_core
 
 # --- Streamlit App ---
 
@@ -222,7 +264,11 @@ uploaded_samp_file = st.sidebar.file_uploader("Upload Sample Spectrum", type=["t
 
 st.sidebar.subheader("Theoretical Model Data")
 # Configurable theoretical substrate file with default
-use_custom_si = st.sidebar.checkbox("Upload Custom Si (n,k) File", value=False)
+si_source = st.sidebar.selectbox(
+    "Si optical constants",
+    ["Si_data.csv", "Schinke.csv", "Green-2008.csv", "Upload custom..."],
+)
+use_custom_si = si_source == "Upload custom..."
 si_file = None
 loader = None
 
@@ -231,8 +277,7 @@ if use_custom_si:
     if si_file:
          loader = MaterialLoader(uploaded_si_file=si_file)
 else:
-    # Use embedded or local default
-    local_si_path = "Si_data.csv"
+    local_si_path = si_source
     if os.path.exists(local_si_path):
         st.sidebar.caption(f"Using default Si (n,k): {local_si_path}")
         loader = MaterialLoader(si_filename=local_si_path)
@@ -258,30 +303,95 @@ config = {
     'top_hbn_thick': 10.0,
     'has_bot_hbn': False,
     'bot_hbn_thick': 10.0,
-    'sample_thick': 0.65
+    'sample_thick': 0.65,
+    'numerical_aperture': 0.0,
+    'contrast_definition': 'relative'
 }
 
 if sub_type == "Si/SiO2":
-    config['sio2_thick'] = st.sidebar.number_input("SiO2 Thickness (nm)", value=285.0)
-    config['temp'] = st.sidebar.number_input("Temperature (K)", value=298.0)
+    inferred_oxide = 285.0
+    for uploaded in (uploaded_sub_file, uploaded_samp_file):
+        if uploaded is not None:
+            match = re.search(r"(\\d+(?:\\.\\d+)?)\\s*nm\\s*SiO2", uploaded.name, re.IGNORECASE)
+            if match:
+                inferred_oxide = float(match.group(1))
+                break
+    spectrum_names = tuple(
+        uploaded.name if uploaded is not None else None
+        for uploaded in (uploaded_sub_file, uploaded_samp_file)
+    )
+    if st.session_state.get("oxide_inference_files") != spectrum_names:
+        st.session_state["sio2_thickness"] = inferred_oxide
+        st.session_state["oxide_inference_files"] = spectrum_names
+    config['sio2_thick'] = st.sidebar.number_input(
+        "SiO2 Thickness (nm)", key="sio2_thickness"
+    )
+    config['temp'] = st.sidebar.number_input(
+        "Temperature (K)", min_value=10.0, max_value=300.0, value=298.0
+    )
 
-config['has_top_hbn'] = st.sidebar.checkbox("Top hBN")
+config['numerical_aperture'] = st.sidebar.number_input(
+    "Illumination NA", min_value=0.0, max_value=0.95, value=0.0, step=0.05,
+    help="Effective filled-pupil illumination NA. Changing it invalidates the previous fit; 0 uses normal incidence."
+)
+
+config['fit_sio2_thickness'] = (
+    sub_type == "Si/SiO2"
+    and st.sidebar.checkbox("Fit SiO2 thickness (+/-20 nm)", value=True)
+)
+
+hbn_filename_hint = any(
+    uploaded is not None and len(re.findall(r"hBN", uploaded.name, re.IGNORECASE)) >= 2
+    for uploaded in (uploaded_sub_file, uploaded_samp_file)
+)
+config['has_top_hbn'] = st.sidebar.checkbox("Top hBN", value=hbn_filename_hint)
 if config['has_top_hbn']:
     config['top_hbn_thick'] = st.sidebar.number_input("Top hBN Thickness (nm)", value=10.0)
 
 config['sample_thick'] = st.sidebar.number_input("Sample Thickness (nm)", value=0.65, format="%.2f")
 
-config['has_bot_hbn'] = st.sidebar.checkbox("Bottom hBN")
+config['has_bot_hbn'] = st.sidebar.checkbox("Bottom hBN", value=hbn_filename_hint)
 if config['has_bot_hbn']:
     config['bot_hbn_thick'] = st.sidebar.number_input("Bottom hBN Thickness (nm)", value=10.0)
+config['fit_hbn_thickness'] = st.sidebar.checkbox(
+    "Fit enabled hBN thicknesses (0-100 nm)",
+    value=hbn_filename_hint,
+    disabled=not (config['has_top_hbn'] or config['has_bot_hbn']),
+)
 
 eps_inf = st.sidebar.number_input("Background Eps (Inf)", value=12.0)
+line_shape = st.sidebar.selectbox(
+    "Exciton line shape", ["Voigt / Faddeeva (Recommended)", "Lorentz"]
+)
+config['line_shape'] = 'Voigt' if line_shape.startswith('Voigt') else 'Lorentz'
+
+model_signature = (
+    si_source,
+    config['substrate_type'],
+    round(float(config.get('sio2_thick', 0.0)), 8),
+    round(float(config.get('temp', 298.0)), 8),
+    round(float(config['numerical_aperture']), 8),
+    round(float(config['sample_thick']), 8),
+    bool(config['has_top_hbn']),
+    round(float(config.get('top_hbn_thick', 0.0)), 8),
+    bool(config['has_bot_hbn']),
+    round(float(config.get('bot_hbn_thick', 0.0)), 8),
+    bool(config['fit_sio2_thickness']),
+    bool(config['fit_hbn_thickness']),
+    config['line_shape'],
+)
+if 'fit_results' in st.session_state:
+    stored = st.session_state.fit_results
+    stored_signature = stored[5] if len(stored) >= 6 else None
+    if stored_signature != model_signature:
+        del st.session_state.fit_results
+        st.sidebar.info("Optical-model settings changed. Run the fit again.")
 
 # Helper to load and process experimental data
 def process_experiments(sub_file, samp_file):
     if not sub_file or not samp_file:
         return None, None, "Files missing"
-    
+
     try:
         sub_file.seek(0)
         df_sub = pd.read_csv(sub_file, sep=None, engine='python', header=None)
@@ -298,14 +408,14 @@ def process_experiments(sub_file, samp_file):
         # Unit Correction (eV -> nm)
         # Assuming if mean < 100, it's eV.
         if np.mean(wl_sub) < 100:
-             wl_sub = 1240.0 / wl_sub
+             wl_sub = HC_EV_NM / wl_sub
              # Sort if needed (inverse flips order)
              idx = np.argsort(wl_sub)
              wl_sub = wl_sub[idx]
              y_sub = y_sub[idx]
 
         if np.mean(wl_samp) < 100:
-             wl_samp = 1240.0 / wl_samp
+             wl_samp = HC_EV_NM / wl_samp
              idx = np.argsort(wl_samp)
              wl_samp = wl_samp[idx]
              y_samp = y_samp[idx]
@@ -313,19 +423,26 @@ def process_experiments(sub_file, samp_file):
         # Interpolate Sample onto Substrate Grid
         f_samp = interp1d(wl_samp, y_samp, kind='cubic', bounds_error=False, fill_value=np.nan)
         y_samp_interp = f_samp(wl_sub)
-        
+
         # Mask valid
         mask = (~np.isnan(y_samp_interp)) & (y_sub != 0)
         wl_final = wl_sub[mask]
         sub_final = y_sub[mask]
         samp_final = y_samp_interp[mask]
-        
+
         # Calculate Contrast
-        contrast = (samp_final - sub_final) / (samp_final + sub_final)
-        
+        substrate_is_unit_placeholder = (
+            np.ptp(sub_final) <= 1e-8 and np.allclose(sub_final, 1.0, atol=1e-8)
+            and np.any(samp_final < 0)
+        )
+        contrast = (
+            samp_final if substrate_is_unit_placeholder
+            else (samp_final - sub_final) / sub_final
+        )
+
         # Return x in eV, y_contrast
-        x_ev = 1240.0 / wl_final
-        
+        x_ev = HC_EV_NM / wl_final
+
         # Sort by eV (low to high)
         idx_ev = np.argsort(x_ev)
         return x_ev[idx_ev], contrast[idx_ev], None
@@ -351,28 +468,45 @@ if x_exp_ev is not None:
 
 roi_min = st.sidebar.number_input("ROI Min (eV)", value=def_min, format="%.2f")
 roi_max = st.sidebar.number_input("ROI Max (eV)", value=def_max, format="%.2f")
-fit_method = st.sidebar.selectbox("Method", ["Standard", "High Precision", "Multi-Stage", "MCMC", "Derivative", "2nd Derivative"])
+fit_method = st.sidebar.selectbox("Method", [
+    "Robust LM (Recommended)",
+    "Global + Robust LM",
+    "1st Derivative + LM",
+    "2nd Derivative + LM",
+])
 config['fit_method'] = fit_method
-config['high_precision'] = (fit_method == "High Precision")
+config['high_precision'] = (fit_method == "Global + Robust LM")
+
+
 
 # Main Content
 col1, col2 = st.columns([1, 1])
+
+# Data processed earlier. Warning if errors are present not needed here if handled above/inline.
+# But process_experiments logic was moved up. The original block down here is now redundant/needs removal.
 
 with col1:
     st.subheader("Excitons Control")
     if 'excitons' not in st.session_state:
         # Use simple column names with emojis for UI
         st.session_state.excitons = pd.DataFrame([
-            {"f": 0.5, "🔒f": False, "E0": 1.96, "🔒E0": False, "Gamma": 0.05, "🔒Gamma": False}
+            {"f": 0.5, "🔒f": False, "E0": 1.96, "🔒E0": False, "wL": 0.03, "🔒wL": False, "wG": 0.03, "🔒wG": False}
         ])
+    elif 'Gamma' in st.session_state.excitons.columns:
+        old = st.session_state.excitons
+        old['wL'] = old['Gamma']
+        old['🔒wL'] = old.get('🔒Gamma', False)
+        old['wG'] = np.maximum(old['Gamma'] / 2, 0.001)
+        old['🔒wG'] = False
+        st.session_state.excitons = old.drop(columns=['Gamma', '🔒Gamma'], errors='ignore')
 
     def add_exciton():
-        new_row = {"f": 0.1, "🔒f": False, "E0": 2.0, "🔒E0": False, "Gamma": 0.05, "🔒Gamma": False}
+        new_row = {"f": 0.1, "🔒f": False, "E0": 2.0, "🔒E0": False, "wL": 0.03, "🔒wL": False, "wG": 0.03, "🔒wG": False}
         st.session_state.excitons = pd.concat([st.session_state.excitons, pd.DataFrame([new_row])], ignore_index=True)
 
     def clear_excitons():
-        st.session_state.excitons = pd.DataFrame(columns=["f", "🔒f", "E0", "🔒E0", "Gamma", "🔒Gamma"])
-        
+        st.session_state.excitons = pd.DataFrame(columns=["f", "🔒f", "E0", "🔒E0", "wL", "🔒wL", "wG", "🔒wG"])
+
     def auto_guess_excitons():
         if x_exp_ev is None:
             st.error("Upload both spectra first.")
@@ -383,27 +517,27 @@ with col1:
             mask = (x_exp_ev >= roi_min) & (x_exp_ev <= roi_max)
             y_roi = y_exp_contrast[mask]
             x_roi = x_exp_ev[mask]
-            
+
             if len(y_roi) < 5:
                 st.error("Not enough points in ROI for auto-guess.")
                 return
 
-            peaks, _ = find_peaks(np.abs(y_roi), prominence=0.01, distance=5)
-            
-            if len(peaks) > 0:
+            guesses = guess_resonances(x_roi, y_roi)
+
+            if len(guesses) > 0:
                 new_data = []
-                for p_idx in peaks:
-                     p_ev = x_roi[p_idx]
+                for p_ev, linewidth in guesses:
                      new_data.append({
-                        "f": 0.1, "🔒f": False, 
-                        "E0": float(p_ev), "🔒E0": False, 
-                        "Gamma": 0.05, "🔒Gamma": False
+                        "f": 0.1, "🔒f": False,
+                        "E0": float(p_ev), "🔒E0": False,
+                        "wL": float(linewidth) / 2, "🔒wL": False,
+                        "wG": float(linewidth) / 2, "🔒wG": False
                      })
                 st.session_state.excitons = pd.DataFrame(new_data)
-                st.success(f"Found {len(peaks)} peaks.")
+                st.success(f"Found {len(guesses)} peaks.")
             else:
                 st.warning("No distinct peaks found.")
-                
+
         except Exception as e:
             st.error(f"Auto-guess error: {e}")
 
@@ -411,21 +545,23 @@ with col1:
     col_btn1.button("Add Exciton", on_click=add_exciton)
     col_btn2.button("Clear", on_click=clear_excitons)
     col_btn3.button("Auto Guess", on_click=auto_guess_excitons)
-    
+
     # Configure columns for better UI
     column_config = {
         "f": st.column_config.NumberColumn("f (eV²)", format="%.4f"),
         "E0": st.column_config.NumberColumn("E0 (eV)", format="%.4f"),
-        "Gamma": st.column_config.NumberColumn("Γ (eV)", format="%.4f"),
+        "wL": st.column_config.NumberColumn("wL (eV)", format="%.4f"),
+        "wG": st.column_config.NumberColumn("wG (eV)", format="%.4f"),
         "🔒f": st.column_config.CheckboxColumn("🔒", width="small"),
         "🔒E0": st.column_config.CheckboxColumn("🔒", width="small"),
-        "🔒Gamma": st.column_config.CheckboxColumn("🔒", width="small"),
+        "🔒wL": st.column_config.CheckboxColumn("🔒", width="small"),
+        "🔒wG": st.column_config.CheckboxColumn("🔒", width="small"),
     }
 
     edited_df = st.data_editor(
-        st.session_state.excitons, 
+        st.session_state.excitons,
         column_config=column_config,
-        num_rows="dynamic", 
+        num_rows="dynamic",
         use_container_width=True
     )
     st.session_state.excitons = edited_df
@@ -437,23 +573,17 @@ with col1:
             # Filter range
             mask = (x_exp_ev >= roi_min) & (x_exp_ev <= roi_max)
             # x for fitting (model expects nm for TMM but lorentz takes eV)
-            # Wait, our fit wrapper uses 1240/x. So we better pass x in nm to fit_func if that's what we designed.
-            # calculate_contrast_dynamic takes nm.
-            # Let's convert x_exp_ev back to nm for fitting x-axis
-            x_fit_nm = 1240.0 / x_exp_ev[mask]
-            # Since x_exp_ev is low->high, x_fit_nm will be high->low. 
-            # It's better to sort x_fit_nm for curve_fit stability although not strictly required for point-wise func
-            
+            # Convert the energy axis back to nm for the optical model.
+            x_fit_nm = HC_EV_NM / x_exp_ev[mask]
+            # x_exp_ev is low-to-high, so the corresponding wavelength axis is descending.
+
             # Let's keep data consistent pairs
             x_fit_ev_roi = x_exp_ev[mask]
             y_fit_exp = y_exp_contrast[mask]
-            
-            # For fitting function:
-            # It expects x which is then passed to dielectric_func(1240/x) [so x is nm]
-            # and calculate_contrast(x) [so x is nm]
-            # So we should pass nm to curve_fit.
-            x_fit_input = 1240.0 / x_fit_ev_roi
-            
+
+            # The optical model receives wavelength while the dielectric model uses energy.
+            x_fit_input = HC_EV_NM / x_fit_ev_roi
+
             if len(x_fit_input) < 5:
                 st.error(f"Not enough data points in ROI ({roi_min}-{roi_max} eV). Loaded {len(x_exp_ev)} points.")
             else:
@@ -462,80 +592,155 @@ with col1:
                 bounds_min = [0]
                 bounds_max = [50]
                 locked_mask = [False] # eps_inf not locked in UI for now
-                
+
+                stride = 4 if config['line_shape'] == 'Voigt' else 3
                 for idx, row in edited_df.iterrows():
-                    p0.extend([row['f'], row['E0'], row['Gamma']])
-                    bounds_min.extend([0, 1.0, 0.001])
-                    bounds_max.extend([50, 4.0, 1.0])
-                    # Update column references to matches new names
-                    locked_mask.extend([row['🔒f'], row['🔒E0'], row['🔒Gamma']])
-                
+                    values = [row['f'], row['E0'], row['wL']]
+                    lower = [0, max(0.1, row['E0'] - 0.02), 0.0001]
+                    upper = [50, row['E0'] + 0.02, 0.5]
+                    locks = [row['🔒f'], row['🔒E0'], row['🔒wL']]
+                    if stride == 4:
+                        values.append(row['wG'])
+                        lower.append(0.0001)
+                        upper.append(0.5)
+                        locks.append(row['🔒wG'])
+                    p0.extend(values)
+                    bounds_min.extend(lower)
+                    bounds_max.extend(upper)
+                    locked_mask.extend(locks)
+
                 p0 = np.array(p0)
                 bounds = (bounds_min, bounds_max)
                 locked_mask = np.array(locked_mask)
-                
+
                 # --- FITTING LOGIC ---
                 progress_bar = st.progress(0, text="Fitting...")
-                
-                def fit_func_wrapper(x_nm, *p_unlocked):
-                    p_full = p0.copy()
-                    p_full[~locked_mask] = p_unlocked
-                    # dielectric takes eV = 1240/x_nm
-                    eps_2d = dielectric_func_lorentz(1240.0/x_nm, p_full)
-                    y_model = calculate_contrast_dynamic(x_nm, eps_2d, loader, config)
-                    
-                    if fit_method == 'Derivative':
-                        # Gradient wrt x_nm? Or eV?
-                        # Using raw gradient on current axis.
-                        return np.gradient(y_model, x_nm) 
-                    return y_model
 
-                # Prepare Data Target
-                if fit_method == 'Derivative':
-                    y_target = np.gradient(y_fit_exp, x_fit_input)
+                derivative_order = {
+                    "1st Derivative + LM": 1,
+                    "2nd Derivative + LM": 2,
+                }.get(fit_method, 0)
+                if derivative_order:
+                    objective_energy = np.tile(x_fit_ev_roi, derivative_order + 1)
+                    y_target = np.zeros(objective_energy.size)
                 else:
+                    objective_energy = x_fit_ev_roi
                     y_target = y_fit_exp
 
-                p_unlocked0 = p0[~locked_mask]
-                b_min_u = np.array(bounds[0])[~locked_mask]
-                b_max_u = np.array(bounds[1])[~locked_mask]
-                
+                physical_count = len(p0)
+                structure_parameters = []
+                if config.get('fit_sio2_thickness', False):
+                    value = float(config['sio2_thick'])
+                    structure_parameters.append(('sio2_thick', value, max(0.0, value - 20.0), value + 20.0))
+                if config.get('fit_hbn_thickness', False):
+                    for enabled_key, thickness_key in (
+                        ('has_top_hbn', 'top_hbn_thick'), ('has_bot_hbn', 'bot_hbn_thick')
+                    ):
+                        if config.get(enabled_key, False):
+                            value = float(config[thickness_key])
+                            structure_parameters.append((thickness_key, value, 0.0, 100.0))
+                for _, value, lower, upper in structure_parameters:
+                    p0 = np.append(p0, value)
+                    bounds = (
+                        np.append(np.asarray(bounds[0], dtype=float), lower),
+                        np.append(np.asarray(bounds[1], dtype=float), upper),
+                    )
+                    locked_mask = np.append(locked_mask, False)
+
+                dielectric_model = (
+                    dielectric_func_voigt
+                    if config['line_shape'] == 'Voigt'
+                    else dielectric_func_lorentz
+                )
+
+                def physical_model(params):
+                    model_config = config.copy()
+                    for offset, (key, _, _, _) in enumerate(structure_parameters):
+                        model_config[key] = params[physical_count + offset]
+                    eps_2d = dielectric_model(x_fit_ev_roi, params[:physical_count])
+                    return calculate_contrast_dynamic(x_fit_input, eps_2d, loader, model_config)
+
+                def model(params):
+                    contrast = physical_model(params)
+                    if derivative_order:
+                        return composite_derivative_residual(
+                            y_fit_exp,
+                            contrast,
+                            x_fit_ev_roi,
+                            maximum_order=derivative_order,
+                        )
+                    return contrast
+
                 try:
                     if config['high_precision']:
-                        st.info("Running Differential Evolution...")
-                        de_bounds = list(zip(b_min_u, b_max_u))
-                        def obj(p):
-                            return np.sum((y_target - fit_func_wrapper(x_fit_input, *p))**2)
-                            
-                        res = differential_evolution(obj, de_bounds, maxiter=50, popsize=10, strategy='best1bin')
-                        p_unlocked_final = res.x
-                    else:
-                        popt, pcov = curve_fit(fit_func_wrapper, x_fit_input, y_target, 
-                                               p0=p_unlocked0, bounds=(b_min_u, b_max_u), maxfev=5000)
-                        p_unlocked_final = popt
-                    
+                        st.info("Running global initialization, robust TRF, and LM refinement...")
+                    if derivative_order:
+                        warm_result = fit_spectrum(
+                            x_fit_ev_roi, y_fit_exp, physical_model, p0, bounds,
+                            locked_mask, baseline_order=3, robust=True,
+                            global_search=config['high_precision'], max_nfev=6000,
+                        )
+                        p0 = warm_result.params
+                    fit_result = fit_spectrum(
+                        objective_energy,
+                        y_target,
+                        model,
+                        p0,
+                        bounds,
+                        locked_mask,
+                        baseline_order=-1 if derivative_order else 3,
+                        robust=True,
+                        global_search=config['high_precision'] and not derivative_order,
+                        sigma=np.ones_like(y_target) if derivative_order else None,
+                        max_nfev=8000,
+                    )
+                    if not fit_result.success:
+                        raise RuntimeError(fit_result.message)
+
                     st.success("Fitting Complete!")
                     progress_bar.empty()
-                    p_full_final = p0.copy()
-                    p_full_final[~locked_mask] = p_unlocked_final
-                    
+                    p_full_final = fit_result.params[:physical_count]
+                    fitted_config = config.copy()
+                    for offset, (key, _, _, _) in enumerate(structure_parameters):
+                        fitted_config[key] = float(fit_result.params[physical_count + offset])
+                    epsilon_roi = dielectric_model(x_fit_ev_roi, p_full_final)
+                    physical_roi = calculate_contrast_dynamic(
+                        x_fit_input, epsilon_roi, loader, fitted_config
+                    )
+                    finalize_physical_fit(
+                        fit_result,
+                        x_fit_ev_roi,
+                        y_fit_exp,
+                        physical_roi,
+                        baseline_order=3,
+                    )
+
                     # Update Excitons
-                    num_exc = (len(p_full_final) - 1) // 3
+                    num_exc = (len(p_full_final) - 1) // stride
                     new_data = []
                     for i in range(num_exc):
-                        base = 1 + i*3
+                        base = 1 + i*stride
                         new_data.append({
                             "f": p_full_final[base],
                             "🔒f": edited_df.iloc[i]['🔒f'],
                             "E0": p_full_final[base+1],
                             "🔒E0": edited_df.iloc[i]['🔒E0'],
-                            "Gamma": p_full_final[base+2],
-                            "🔒Gamma": edited_df.iloc[i]['🔒Gamma']
+                            "wL": p_full_final[base+2],
+                            "🔒wL": edited_df.iloc[i]['🔒wL'],
+                            "wG": p_full_final[base+3] if stride == 4 else edited_df.iloc[i]['wG'],
+                            "🔒wG": edited_df.iloc[i]['🔒wG']
                         })
                     st.session_state.excitons = pd.DataFrame(new_data)
-                    st.session_state.fit_results = (x_fit_input, y_fit_exp, p_full_final)
+                    st.session_state.fit_results = (
+                        x_fit_input,
+                        y_fit_exp,
+                        p_full_final,
+                        fit_result,
+                        fitted_config,
+                        model_signature,
+                    )
                     st.rerun()
-                    
+
                 except Exception as e:
                     st.error(f"Fitting failed: {e}")
 
@@ -543,14 +748,36 @@ with col1:
     if 'fit_results' in st.session_state:
         st.divider()
         st.subheader("Export Results")
-        x_fit_nm_res, y_fit_exp_res, p_final = st.session_state.fit_results
+        x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _ = st.session_state.fit_results
 
         # Recalculate y_model for consistency
         # Warning: scope. Let's re-calculate basics.
-        x_ev_export = 1240.0 / x_fit_nm_res
-        eps_model_e = dielectric_func_lorentz(x_ev_export, p_final)
-        y_model_e = calculate_contrast_dynamic(x_fit_nm_res, eps_model_e, loader, config)
-        
+        x_ev_export = HC_EV_NM / x_fit_nm_res
+        dielectric_model = dielectric_func_voigt if fitted_config.get('line_shape') == 'Voigt' else dielectric_func_lorentz
+        eps_model_e = dielectric_model(x_ev_export, p_final)
+        physical_model_e = calculate_contrast_dynamic(
+            x_fit_nm_res, eps_model_e, loader, fitted_config
+        )
+        y_model_e = fit_result.add_baseline(physical_model_e, x_ev_export)
+
+        st.caption(
+            f"{fit_result.method} | RMSE={fit_result.rmse:.4g} | "
+            f"R2={fit_result.r_squared:.5f} | condition={fit_result.jacobian_condition:.3g} | "
+            f"Durbin-Watson={fit_result.durbin_watson:.3f}"
+        )
+        fitted_names = []
+        if fitted_config.get('fit_sio2_thickness', False):
+            fitted_names.append(('SiO2', 'sio2_thick'))
+        if fitted_config.get('fit_hbn_thickness', False):
+            if fitted_config.get('has_top_hbn'):
+                fitted_names.append(('top hBN', 'top_hbn_thick'))
+            if fitted_config.get('has_bot_hbn'):
+                fitted_names.append(('bottom hBN', 'bot_hbn_thick'))
+        for label, key in fitted_names:
+            st.caption(f"Fitted {label} thickness: {fitted_config[key]:.3f} nm")
+        if fit_result.jacobian_condition > 1e10:
+            st.warning("The Jacobian is ill-conditioned; some fitted parameters are not independently identifiable.")
+
         # 1. Export Spectrum Data
         export_df = pd.DataFrame({
             "Energy_eV": x_ev_export,
@@ -566,17 +793,26 @@ with col1:
             "text/csv",
             key='download-spectrum'
         )
-        
+
         # 2. Export Parameters
         params_export = []
-        params_export.append({"Parameter": "Eps_Inf", "Value": p_final[0]})
-        num_osc = (len(p_final) - 1) // 3
+        params_export.append({"Parameter": "Eps_Inf", "Value": p_final[0], "Std_Error": fit_result.standard_errors[0]})
+        stride = 4 if fitted_config.get('line_shape') == 'Voigt' else 3
+        num_osc = (len(p_final) - 1) // stride
         for i in range(num_osc):
-            base = 1 + i*3
-            params_export.append({"Parameter": f"Oscillator {i+1} f", "Value": p_final[base]})
-            params_export.append({"Parameter": f"Oscillator {i+1} E0", "Value": p_final[base+1]})
-            params_export.append({"Parameter": f"Oscillator {i+1} Gamma", "Value": p_final[base+2]})
-        
+            base = 1 + i*stride
+            params_export.append({"Parameter": f"Oscillator {i+1} f", "Value": p_final[base], "Std_Error": fit_result.standard_errors[base]})
+            params_export.append({"Parameter": f"Oscillator {i+1} E0", "Value": p_final[base+1], "Std_Error": fit_result.standard_errors[base+1]})
+            params_export.append({"Parameter": f"Oscillator {i+1} wL", "Value": p_final[base+2], "Std_Error": fit_result.standard_errors[base+2]})
+            if stride == 4:
+                params_export.append({"Parameter": f"Oscillator {i+1} wG", "Value": p_final[base+3], "Std_Error": fit_result.standard_errors[base+3]})
+        for offset, (label, key) in enumerate(fitted_names):
+            params_export.append({
+                "Parameter": f"{label} Thickness (nm)",
+                "Value": fitted_config[key],
+                "Std_Error": fit_result.standard_errors[len(p_final) + offset],
+            })
+
         df_params = pd.DataFrame(params_export)
         csv_params = df_params.to_csv(index=False).encode('utf-8')
         st.download_button(
@@ -589,26 +825,30 @@ with col1:
 
 with col2:
     st.subheader("Plot")
-    
+
     fig, ax = plt.subplots()
     ax.set_xlabel("Energy (eV)")
     ax.set_ylabel("Contrast")
-    
+
     # Plot experimental data
     if x_exp_ev is not None:
         ax.plot(x_exp_ev, y_exp_contrast, 'k.', label='Experiment', markersize=2)
-        
+
         # Plot Fit
         if 'fit_results' in st.session_state:
-            x_fit_nm_res, y_fit_exp_res, p_final = st.session_state.fit_results
+            x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _ = st.session_state.fit_results
             # Show Fit
-            wl_full = 1240.0 / x_exp_ev
-            eps_model = dielectric_func_lorentz(x_exp_ev, p_final) # eV input
-            y_model = calculate_contrast_dynamic(wl_full, eps_model, loader, config)
+            wl_full = HC_EV_NM / x_exp_ev
+            dielectric_model = dielectric_func_voigt if fitted_config.get('line_shape') == 'Voigt' else dielectric_func_lorentz
+            eps_model = dielectric_model(x_exp_ev, p_final)
+            physical_model = calculate_contrast_dynamic(
+                wl_full, eps_model, loader, fitted_config
+            )
+            y_model = fit_result.add_baseline(physical_model, x_exp_ev)
             ax.plot(x_exp_ev, y_model, 'r-', label='Fit', linewidth=2)
-            
+
         ax.set_xlim(roi_min, roi_max)
-        
+
         # Auto ylim
         mask = (x_exp_ev >= roi_min) & (x_exp_ev <= roi_max)
         if np.any(mask):
@@ -616,9 +856,1417 @@ with col2:
             ymin, ymax = np.min(y_roi), np.max(y_roi)
             margin = (ymax - ymin) * 0.1 if (ymax!=ymin) else 0.1
             ax.set_ylim(ymin - margin, ymax + margin)
-            
+
     ax.legend()
     st.pyplot(fig)
+`;
+
+        const opticalModelContent = `"""Core normal-incidence optical model for 2D-material contrast fitting."""
+
+import numpy as np
+from scipy.special import wofz
+
+
+HC_EV_NM = 1239.8419843320026
+
+
+def dielectric_func_lorentz(energy_ev, params):
+    """Return epsilon(E) for [eps_inf, f1, E01, gamma1, ...]."""
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    params = np.asarray(params, dtype=float)
+    if params.size < 1 or (params.size - 1) % 3:
+        raise ValueError("Lorentz parameters must be [eps_inf, f, E0, gamma, ...]")
+
+    epsilon = np.full(energy_ev.shape, params[0], dtype=complex)
+    for strength, resonance, linewidth in params[1:].reshape(-1, 3):
+        denominator = resonance**2 - energy_ev**2 - 1j * energy_ev * linewidth
+        epsilon += strength / denominator
+    return epsilon
+
+
+def dielectric_func_voigt(energy_ev, params):
+    """Complex Voigt dielectric response using Faddeeva oscillators.
+
+    Parameters are \`\`[eps_b, f1, E1, wL1, wG1, ...]\`\` where \`\`wL\`\` and
+    \`\`wG\`\` are Lorentzian and Gaussian FWHM values in eV.
+    """
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    params = np.asarray(params, dtype=float)
+    if params.size < 1 or (params.size - 1) % 4:
+        raise ValueError("Voigt parameters must be [eps_b, f, E0, wL, wG, ...]")
+
+    epsilon = np.full(energy_ev.shape, params[0], dtype=complex)
+    root_ln2 = np.sqrt(np.log(2.0))
+    prefactor_constant = 2j * np.sqrt(np.pi * np.log(2.0))
+    for strength, resonance, lorentz_fwhm, gaussian_fwhm in params[1:].reshape(-1, 4):
+        if lorentz_fwhm <= 0 or gaussian_fwhm <= 0:
+            raise ValueError("Voigt linewidths must be positive")
+        argument = (
+            2.0 * root_ln2 * (energy_ev - resonance) / gaussian_fwhm
+            + 1j * root_ln2 * lorentz_fwhm / gaussian_fwhm
+        )
+        epsilon += strength * prefactor_constant / gaussian_fwhm * wofz(argument)
+    return epsilon
+
+
+def spectral_derivative(values, wavelengths_nm, order=1):
+    """Differentiate spectral values with respect to photon energy (eV)."""
+    result = np.asarray(values, dtype=float)
+    energy_ev = HC_EV_NM / np.asarray(wavelengths_nm, dtype=float)
+    for _ in range(order):
+        result = np.gradient(result, energy_ev, edge_order=2)
+    return result
+
+
+def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
+    """Calculate normal-incidence multilayer reflectance contrast.
+
+    \`\`contrast_definition\`\` may be \`\`relative\`\` (the default,
+    (R_sample-R_ref)/R_ref) or \`\`symmetric\`\`
+    ((R_sample-R_ref)/(R_sample+R_ref)).
+    """
+    wavelengths_nm = np.atleast_1d(np.asarray(wavelengths_nm, dtype=float))
+    eps_sample = np.broadcast_to(np.asarray(eps_sample, dtype=complex), wavelengths_nm.shape)
+    if np.any(~np.isfinite(wavelengths_nm)) or np.any(wavelengths_nm <= 0):
+        raise ValueError("Wavelengths must be finite and positive")
+
+    n_2d = np.sqrt(eps_sample)
+    # Select the passive square-root branch for the exp(-i*omega*t) convention.
+    n_2d = np.where(np.imag(n_2d) < 0, -n_2d, n_2d)
+    substrate_type = config.get("substrate_type", "Si/SiO2")
+
+    if substrate_type == "Si/SiO2":
+        n_substrate = mat_loader.get_si_n_with_temp(
+            wavelengths_nm, config.get("temp", 298.0)
+        )
+        n_oxide = mat_loader.get_sio2_n(wavelengths_nm)
+    elif substrate_type == "TiO2":
+        n_substrate = mat_loader.get_tio2_n(wavelengths_nm)
+        n_oxide = None
+    elif substrate_type == "Quartz":
+        n_substrate = mat_loader.get_quartz_n(wavelengths_nm)
+        n_oxide = None
+    elif substrate_type == "Sapphire":
+        n_substrate = mat_loader.get_sapphire_n(wavelengths_nm)
+        n_oxide = None
+    else:
+        raise ValueError(f"Unsupported substrate type: {substrate_type}")
+
+    n_substrate = np.broadcast_to(np.asarray(n_substrate, dtype=complex), wavelengths_nm.shape)
+    n_hbn = np.broadcast_to(
+        np.asarray(mat_loader.get_hbn_n(wavelengths_nm), dtype=complex),
+        wavelengths_nm.shape,
+    )
+
+    def layer_stack(include_sample, include_hbn):
+        layers = []
+        if include_hbn and config.get("has_top_hbn", False):
+            layers.append((n_hbn, config.get("top_hbn_thick", 0.0)))
+        if include_sample:
+            layers.append((n_2d, config.get("sample_thick", 0.65)))
+        if include_hbn and config.get("has_bot_hbn", False):
+            layers.append((n_hbn, config.get("bot_hbn_thick", 0.0)))
+        if n_oxide is not None:
+            layers.append((n_oxide, config.get("sio2_thick", 285.0)))
+        return layers
+
+    def reflectance_at_angle(include_sample, include_hbn, sine_squared, polarization):
+        layers = layer_stack(include_sample, include_hbn)
+        matrix = np.broadcast_to(np.eye(2, dtype=complex), (wavelengths_nm.size, 2, 2)).copy()
+        for index, thickness_nm in layers:
+            normal_wavevector = np.sqrt(index**2 - sine_squared + 0j)
+            normal_wavevector = np.where(
+                np.imag(normal_wavevector) < 0, -normal_wavevector, normal_wavevector
+            )
+            admittance = (
+                normal_wavevector
+                if polarization == "s"
+                else index**2 / normal_wavevector
+            )
+            phase = 2 * np.pi * normal_wavevector * thickness_nm / wavelengths_nm
+            cos_phase = np.cos(phase)
+            sin_phase = np.sin(phase)
+            layer_matrix = np.empty_like(matrix)
+            layer_matrix[:, 0, 0] = cos_phase
+            layer_matrix[:, 0, 1] = -1j * sin_phase / admittance
+            layer_matrix[:, 1, 0] = -1j * admittance * sin_phase
+            layer_matrix[:, 1, 1] = cos_phase
+            matrix = matrix @ layer_matrix
+
+        substrate_wavevector = np.sqrt(n_substrate**2 - sine_squared + 0j)
+        substrate_wavevector = np.where(
+            np.imag(substrate_wavevector) < 0, -substrate_wavevector, substrate_wavevector
+        )
+        substrate_admittance = (
+            substrate_wavevector
+            if polarization == "s"
+            else n_substrate**2 / substrate_wavevector
+        )
+        incident_wavevector = np.sqrt(1.0 - sine_squared + 0j)
+        incident_admittance = (
+            incident_wavevector
+            if polarization == "s"
+            else 1.0 / incident_wavevector
+        )
+        denominator = matrix[:, 0, 0] + matrix[:, 0, 1] * substrate_admittance
+        admittance = (
+            matrix[:, 1, 0] + matrix[:, 1, 1] * substrate_admittance
+        ) / denominator
+        amplitude = (incident_admittance - admittance) / (incident_admittance + admittance)
+        return np.abs(amplitude) ** 2
+
+    def reflectance(include_sample, include_hbn):
+        numerical_aperture = float(config.get("numerical_aperture", 0.0))
+        if not 0.0 <= numerical_aperture < 1.0:
+            raise ValueError("numerical_aperture must be in [0, 1)")
+        if numerical_aperture == 0.0:
+            return reflectance_at_angle(include_sample, include_hbn, 0.0, "s")
+
+        # Uniform illumination of the objective pupil is uniform in sin(theta)^2.
+        angular_points = max(2, int(config.get("angular_points", 7)))
+        nodes, weights = np.polynomial.legendre.leggauss(angular_points)
+        sine_squared = 0.5 * numerical_aperture**2 * (nodes + 1.0)
+        normalized_weights = 0.5 * weights
+        averaged = np.zeros(wavelengths_nm.shape, dtype=float)
+        for value, weight in zip(sine_squared, normalized_weights):
+            reflectance_s = reflectance_at_angle(include_sample, include_hbn, value, "s")
+            reflectance_p = reflectance_at_angle(include_sample, include_hbn, value, "p")
+            averaged += weight * 0.5 * (reflectance_s + reflectance_p)
+        return averaged
+
+    sample_reflectance = reflectance(include_sample=True, include_hbn=True)
+    reference_reflectance = reflectance(
+        include_sample=False,
+        include_hbn=config.get("reference_includes_hbn", False),
+    )
+    definition = config.get("contrast_definition", "relative")
+    if definition == "symmetric":
+        denominator = sample_reflectance + reference_reflectance
+    elif definition == "relative":
+        denominator = reference_reflectance
+    else:
+        raise ValueError(f"Unsupported contrast definition: {definition}")
+
+    return np.divide(
+        sample_reflectance - reference_reflectance,
+        denominator,
+        out=np.zeros_like(sample_reflectance),
+        where=np.abs(denominator) > np.finfo(float).eps,
+    )
+`;
+
+        const fittingEngineContent = `"""Robust nonlinear least-squares engine for optical spectrum metrology."""
+
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.optimize import differential_evolution, least_squares
+from scipy.signal import find_peaks, peak_widths, savgol_filter
+from scipy.special import expit
+
+
+class FitCancelled(RuntimeError):
+    """Raised when a caller requests cancellation during optimization."""
+
+
+@dataclass
+class FitResult:
+    params: np.ndarray
+    fitted: np.ndarray
+    physical_model: np.ndarray
+    baseline_coefficients: np.ndarray
+    baseline_center: float
+    baseline_scale: float
+    standard_errors: np.ndarray
+    covariance: np.ndarray
+    success: bool
+    message: str
+    method: str
+    nfev: int
+    rmse: float
+    mae: float
+    r_squared: float
+    reduced_chi_squared: float
+    jacobian_condition: float
+    durbin_watson: float
+
+    def add_baseline(self, physical_model, energy_ev):
+        """Apply the fitted additive baseline to model values."""
+        physical_model = np.asarray(physical_model, dtype=float)
+        if self.baseline_coefficients.size == 0:
+            return physical_model
+        x = (np.asarray(energy_ev, dtype=float) - self.baseline_center) / self.baseline_scale
+        design = np.vander(x, N=self.baseline_coefficients.size, increasing=True)
+        return physical_model + design @ self.baseline_coefficients
+
+
+def smoothed_spectral_derivative(values, energy_ev, order=1, smoothing_ev=None):
+    """Savitzky-Golay derivative on a uniform energy grid with noise suppression."""
+    values = np.asarray(values, dtype=float)
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    if values.shape != energy_ev.shape or values.ndim != 1 or values.size < 7:
+        raise ValueError("derivative data must be equal one-dimensional arrays with >=7 points")
+    if order not in (1, 2):
+        raise ValueError("derivative order must be 1 or 2")
+    sort_order = np.argsort(energy_ev)
+    energy_sorted = energy_ev[sort_order]
+    values_sorted = values[sort_order]
+    uniform_energy = np.linspace(energy_sorted[0], energy_sorted[-1], energy_sorted.size)
+    uniform_values = np.interp(uniform_energy, energy_sorted, values_sorted)
+    spacing = float(uniform_energy[1] - uniform_energy[0])
+    smoothing_ev = (0.004 if order == 1 else 0.008) if smoothing_ev is None else smoothing_ev
+    window = max(order + 4, int(np.ceil(smoothing_ev / spacing)))
+    window += 1 - window % 2
+    maximum_window = values.size if values.size % 2 else values.size - 1
+    window = min(window, maximum_window)
+    polynomial_order = min(max(3, order + 2), window - 2)
+    derivative_uniform = savgol_filter(
+        uniform_values,
+        window,
+        polynomial_order,
+        deriv=order,
+        delta=spacing,
+        mode="interp",
+    )
+    derivative_sorted = np.interp(energy_sorted, uniform_energy, derivative_uniform)
+    derivative = np.empty_like(derivative_sorted)
+    derivative[sort_order] = derivative_sorted
+    return derivative
+
+
+def finalize_physical_fit(result, energy_ev, measured, physical_model, baseline_order=3):
+    """Re-evaluate a fit in the original spectrum domain after derivative fitting."""
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    measured = np.asarray(measured, dtype=float)
+    physical_model = np.asarray(physical_model, dtype=float)
+    design, center, scale = _baseline_design(energy_ev, baseline_order)
+    coefficients, baseline = _profile_baseline(measured - physical_model, design)
+    fitted = physical_model + baseline
+    residual = fitted - measured
+    rss = float(np.sum(residual**2))
+    total = float(np.sum((measured - np.mean(measured)) ** 2))
+    result.objective_r_squared = result.r_squared
+    result.baseline_coefficients = coefficients
+    result.baseline_center = center
+    result.baseline_scale = scale
+    result.physical_model = physical_model
+    result.fitted = fitted
+    result.rmse = float(np.sqrt(np.mean(residual**2)))
+    result.mae = float(np.mean(np.abs(residual)))
+    result.r_squared = 1.0 - rss / total if total > 0 else np.nan
+    result.durbin_watson = float(np.sum(np.diff(residual) ** 2) / rss) if rss > 0 else np.nan
+    return result
+
+
+def composite_derivative_residual(
+    measured, predicted, energy_ev, maximum_order, baseline_order=3
+):
+    """Joint spectrum/derivative residual used for stable derivative fitting."""
+    measured = np.asarray(measured, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    design, _, _ = _baseline_design(energy_ev, baseline_order)
+    _, baseline = _profile_baseline(measured - predicted, design)
+    fitted = predicted + baseline
+    residual_blocks = []
+    derivative_weights = (1.0, 1.0, 0.5)
+    measured_component = measured
+    fitted_component = fitted
+    for order in range(maximum_order + 1):
+        if order:
+            measured_component = smoothed_spectral_derivative(
+                measured, energy_ev, order=order
+            )
+            fitted_component = smoothed_spectral_derivative(
+                fitted, energy_ev, order=order
+            )
+        scale = max(float(np.std(measured_component)), np.finfo(float).eps)
+        residual_blocks.append(
+            derivative_weights[order] * (fitted_component - measured_component) / scale
+        )
+    return np.concatenate(residual_blocks)
+
+
+def guess_resonances(
+    energy_ev,
+    contrast,
+    max_peaks=6,
+    min_separation_ev=0.04,
+    max_linewidth_ev=0.12,
+    peak_dip_merge_ev=0.035,
+):
+    """Return robust initial (energy, FWHM) guesses after removing slow drift."""
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    contrast = np.asarray(contrast, dtype=float)
+    if energy_ev.ndim != 1 or energy_ev.shape != contrast.shape or energy_ev.size < 11:
+        return np.empty((0, 2))
+    order = np.argsort(energy_ev)
+    energy = energy_ev[order]
+    values = contrast[order]
+    spacing = float(np.median(np.diff(energy)))
+    if spacing <= 0:
+        return np.empty((0, 2))
+
+    def odd_window(fraction, minimum):
+        window = max(minimum, int(round(values.size * fraction)))
+        window += 1 - window % 2
+        return min(window, values.size - 1 + values.size % 2)
+
+    smooth_window = odd_window(0.015, 7)
+    smooth = savgol_filter(values, smooth_window, min(3, smooth_window - 2))
+    normalized_energy = (energy - np.mean(energy)) / max(np.ptp(energy), np.finfo(float).eps)
+    background = np.polyval(np.polyfit(normalized_energy, smooth, deg=min(3, values.size - 1)), normalized_energy)
+    feature = smooth - background
+    prominence = max(5.0 * _noise_scale(values), 0.008 * np.ptp(feature))
+    distance = max(1, int(np.ceil(min_separation_ev / spacing)))
+    positive, positive_properties = find_peaks(feature, prominence=prominence, distance=distance)
+    negative, negative_properties = find_peaks(-feature, prominence=prominence, distance=distance)
+    candidates = []
+    if positive.size:
+        widths = peak_widths(feature, positive, rel_height=0.5)[0] * spacing
+        candidates.extend(zip(positive, positive_properties["prominences"], widths))
+    if negative.size:
+        widths = peak_widths(-feature, negative, rel_height=0.5)[0] * spacing
+        candidates.extend(zip(negative, negative_properties["prominences"], widths))
+    if not candidates:
+        return np.empty((0, 2))
+    candidates = [
+        item
+        for item in candidates
+        if item[2] <= max_linewidth_ev
+        and min(energy[item[0]] - energy[0], energy[-1] - energy[item[0]]) >= item[2]
+    ]
+    if not candidates:
+        return np.empty((0, 2))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    selected = []
+    for candidate in candidates:
+        candidate_energy = energy[candidate[0]]
+        if all(abs(candidate_energy - energy[item[0]]) >= peak_dip_merge_ev for item in selected):
+            selected.append(candidate)
+        if len(selected) == max_peaks:
+            break
+    guesses = np.array([
+        (energy[index], np.clip(width, 0.005, 0.5))
+        for index, _, width in selected
+    ])
+    return guesses[np.argsort(guesses[:, 0])]
+
+
+def _noise_scale(values):
+    """Estimate point noise from second differences without fitting spectral level."""
+    values = np.asarray(values, dtype=float)
+    if values.size < 5:
+        scale = np.std(values)
+    else:
+        second_difference = np.diff(values, n=2)
+        median = np.median(second_difference)
+        scale = 1.4826 * np.median(np.abs(second_difference - median)) / np.sqrt(6.0)
+    dynamic_range = np.ptp(values)
+    floor = max(np.finfo(float).eps, dynamic_range * 1e-6)
+    return max(float(scale), floor)
+
+
+def _baseline_design(energy_ev, order, center=None, scale=None):
+    if order < 0:
+        return np.empty((len(energy_ev), 0)), 0.0, 1.0
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    center = float(np.mean(energy_ev)) if center is None else float(center)
+    scale = float(np.ptp(energy_ev) / 2.0) if scale is None else float(scale)
+    if scale <= 0:
+        scale = 1.0
+    normalized = (energy_ev - center) / scale
+    return np.vander(normalized, N=order + 1, increasing=True), center, scale
+
+
+def _profile_baseline(target_minus_model, design, weights=None):
+    if design.shape[1] == 0:
+        return np.empty(0), np.zeros_like(target_minus_model)
+    if weights is None:
+        coefficients, *_ = np.linalg.lstsq(design, target_minus_model, rcond=None)
+    else:
+        root_weight = np.sqrt(weights)
+        coefficients, *_ = np.linalg.lstsq(
+            design * root_weight[:, None], target_minus_model * root_weight, rcond=None
+        )
+    return coefficients, design @ coefficients
+
+
+def _huber_weights(residual, tuning=1.345):
+    residual = np.asarray(residual, dtype=float)
+    center = np.median(residual)
+    scale = 1.4826 * np.median(np.abs(residual - center))
+    if not np.isfinite(scale) or scale <= np.finfo(float).eps:
+        return np.ones_like(residual)
+    normalized = np.abs(residual - center) / (tuning * scale)
+    weights = np.ones_like(normalized)
+    np.divide(1.0, normalized, out=weights, where=normalized > 1.0)
+    return weights
+
+
+def _to_unconstrained(params, lower, upper):
+    fraction = (params - lower) / (upper - lower)
+    fraction = np.clip(fraction, 1e-9, 1.0 - 1e-9)
+    return np.log(fraction / (1.0 - fraction))
+
+
+def _from_unconstrained(values, lower, upper):
+    return lower + (upper - lower) * expit(values)
+
+
+def fit_spectrum(
+    energy_ev,
+    measured,
+    model,
+    initial_params,
+    bounds,
+    locked_mask=None,
+    *,
+    baseline_order=1,
+    robust=True,
+    global_search=False,
+    sigma=None,
+    max_nfev=5000,
+    cancel_check=None,
+    random_seed=0,
+):
+    """Fit a spectrum using robust TRF followed by transformed-variable LM.
+
+    \`\`model\`\` receives the full physical parameter vector. Finite bounds are
+    enforced during LM through a logistic parameter transform. An additive
+    polynomial baseline is solved analytically at every nonlinear iteration
+    (variable projection), so nuisance drift does not enlarge the nonlinear
+    parameter space.
+    """
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    measured = np.asarray(measured, dtype=float)
+    initial_params = np.asarray(initial_params, dtype=float)
+    lower = np.asarray(bounds[0], dtype=float)
+    upper = np.asarray(bounds[1], dtype=float)
+    if energy_ev.shape != measured.shape or energy_ev.ndim != 1:
+        raise ValueError("energy_ev and measured must be one-dimensional arrays of equal length")
+    if initial_params.shape != lower.shape or lower.shape != upper.shape:
+        raise ValueError("initial_params and bounds must have identical shapes")
+    if np.any(~np.isfinite(energy_ev)) or np.any(~np.isfinite(measured)):
+        raise ValueError("fit data must be finite")
+    if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)):
+        raise ValueError("bounded LM requires finite lower and upper bounds")
+    if np.any(lower >= upper) or np.any(initial_params < lower) or np.any(initial_params > upper):
+        raise ValueError("initial parameters must lie inside valid bounds")
+
+    locked = np.zeros(initial_params.size, dtype=bool) if locked_mask is None else np.asarray(locked_mask, dtype=bool)
+    if locked.shape != initial_params.shape:
+        raise ValueError("locked_mask must match initial_params")
+    free = ~locked
+    if measured.size <= np.count_nonzero(free) + max(baseline_order + 1, 0):
+        raise ValueError("not enough spectral points for the requested parameters")
+
+    design, baseline_center, baseline_scale = _baseline_design(energy_ev, baseline_order)
+    noise = np.full(measured.shape, _noise_scale(measured)) if sigma is None else np.broadcast_to(np.asarray(sigma, dtype=float), measured.shape)
+    if np.any(~np.isfinite(noise)) or np.any(noise <= 0):
+        raise ValueError("sigma must contain finite positive values")
+
+    def check_cancelled():
+        if cancel_check is not None and cancel_check():
+            raise FitCancelled("Fitting stopped")
+
+    def full_params(free_params):
+        params = initial_params.copy()
+        params[free] = free_params
+        return params
+
+    def raw_residual(free_params, weights=None):
+        check_cancelled()
+        prediction = np.asarray(model(full_params(free_params)), dtype=float)
+        if prediction.shape != measured.shape or np.any(~np.isfinite(prediction)):
+            raise ValueError("model returned non-finite values or an invalid shape")
+        coefficients, baseline = _profile_baseline(measured - prediction, design, weights)
+        return prediction + baseline - measured, coefficients, prediction + baseline
+
+    free_initial = initial_params[free]
+    free_lower = lower[free]
+    free_upper = upper[free]
+    if not np.any(free):
+        residual, coefficients, fitted = raw_residual(free_initial)
+        final_free = free_initial
+        jacobian = np.empty((measured.size, 0))
+        method = "fixed"
+        nfev = 1
+        success = True
+        message = "All physical parameters were locked"
+        final_weights = np.ones_like(measured)
+    else:
+        if global_search:
+            def global_objective(candidate):
+                residual, _, _ = raw_residual(candidate)
+                normalized = residual / noise
+                # A clipped quadratic prevents a few detector spikes dominating initialization.
+                return float(np.sum(np.minimum(normalized**2, 25.0)))
+
+            global_result = differential_evolution(
+                global_objective,
+                list(zip(free_lower, free_upper)),
+                seed=random_seed,
+                strategy="best1bin",
+                popsize=12,
+                maxiter=120,
+                tol=1e-7,
+                polish=False,
+                workers=1,
+                updating="immediate",
+            )
+            free_initial = global_result.x
+
+        def trf_residual(candidate):
+            residual, _, _ = raw_residual(candidate)
+            return residual / noise
+
+        trf = least_squares(
+            trf_residual,
+            free_initial,
+            bounds=(free_lower, free_upper),
+            method="trf",
+            loss="soft_l1" if robust else "linear",
+            f_scale=1.0,
+            x_scale="jac",
+            jac="3-point",
+            max_nfev=max_nfev,
+            ftol=1e-10,
+            xtol=1e-10,
+            gtol=1e-10,
+        )
+
+        trf_raw, _, _ = raw_residual(trf.x)
+        robust_weights = _huber_weights(trf_raw / noise) if robust else np.ones_like(measured)
+        final_weights = robust_weights
+        root_weight = np.sqrt(robust_weights) / noise
+        unconstrained_initial = _to_unconstrained(trf.x, free_lower, free_upper)
+
+        def lm_residual(unconstrained):
+            candidate = _from_unconstrained(unconstrained, free_lower, free_upper)
+            residual, _, _ = raw_residual(candidate, robust_weights)
+            return residual * root_weight
+
+        # LM is efficient near the solution; the transform retains physical bounds.
+        lm = least_squares(
+            lm_residual,
+            unconstrained_initial,
+            method="lm",
+            jac="3-point",
+            x_scale="jac",
+            max_nfev=max_nfev,
+            ftol=1e-12,
+            xtol=1e-12,
+            gtol=1e-12,
+        )
+        final_free = _from_unconstrained(lm.x, free_lower, free_upper)
+        residual, coefficients, fitted = raw_residual(final_free, robust_weights)
+        jacobian = lm.jac
+        method = ("DE + " if global_search else "") + "robust TRF + bounded LM"
+        nfev = trf.nfev + lm.nfev
+        success = bool(trf.success and lm.success)
+        message = f"TRF: {trf.message}; LM: {lm.message}"
+
+    params = full_params(final_free)
+    physical_model = np.asarray(model(params), dtype=float)
+    if design.shape[1]:
+        fitted = physical_model + design @ coefficients
+    residual = fitted - measured
+    degrees_of_freedom = measured.size - np.count_nonzero(free) - design.shape[1]
+    weighted_rss = float(np.sum(final_weights * (residual / noise) ** 2))
+    covariance_free = np.full((np.count_nonzero(free), np.count_nonzero(free)), np.nan)
+    condition = np.inf
+    if np.any(free) and jacobian.size:
+        information = jacobian.T @ jacobian
+        condition = float(np.linalg.cond(information))
+        if np.linalg.matrix_rank(information) == information.shape[0]:
+            covariance_z = np.linalg.inv(information) * weighted_rss / max(degrees_of_freedom, 1)
+            fraction = (final_free - free_lower) / (free_upper - free_lower)
+            derivative = (free_upper - free_lower) * fraction * (1.0 - fraction)
+            covariance_free = covariance_z * np.outer(derivative, derivative)
+
+    covariance = np.full((params.size, params.size), np.nan)
+    covariance[np.ix_(free, free)] = covariance_free
+    standard_errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+    standard_errors[locked] = 0.0
+    total_variance = float(np.sum((measured - np.mean(measured)) ** 2))
+    rss = float(np.sum(residual**2))
+    r_squared = 1.0 - rss / total_variance if total_variance > 0 else np.nan
+    differences = np.diff(residual)
+    durbin_watson = float(np.sum(differences**2) / rss) if rss > 0 else np.nan
+
+    return FitResult(
+        params=params,
+        fitted=fitted,
+        physical_model=physical_model,
+        baseline_coefficients=coefficients,
+        baseline_center=baseline_center,
+        baseline_scale=baseline_scale,
+        standard_errors=standard_errors,
+        covariance=covariance,
+        success=success,
+        message=message,
+        method=method,
+        nfev=nfev,
+        rmse=float(np.sqrt(np.mean(residual**2))),
+        mae=float(np.mean(np.abs(residual))),
+        r_squared=float(r_squared),
+        reduced_chi_squared=weighted_rss / max(degrees_of_freedom, 1),
+        jacobian_condition=condition,
+        durbin_watson=durbin_watson,
+    )
+`;
+
+        const materialsContent = `import numpy as np
+import csv
+import io
+from pathlib import Path
+from scipy.interpolate import PchipInterpolator
+
+
+def read_si_optical_constants(source):
+    """Read numeric wavelength,n,k data or separate wl,n and wl,k sections."""
+    if hasattr(source, "read"):
+        if hasattr(source, "seek"):
+            source.seek(0)
+        content = source.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8-sig")
+    else:
+        content = Path(source).read_text(encoding="utf-8-sig")
+
+    legacy = []
+    sections = {"n": [], "k": []}
+    current_section = None
+    for row in csv.reader(io.StringIO(content)):
+        row = [cell.strip() for cell in row]
+        if len(row) < 2 or not row[0]:
+            continue
+        first = row[0].lower()
+        second = row[1].lower()
+        if first in {"wl", "wavelength", "lambda", "wavelength_um", "wavelength_nm"}:
+            third_header = row[2].lower() if len(row) >= 3 else ""
+            current_section = "legacy" if second == "n" and third_header == "k" else (
+                second if second in sections else None
+            )
+            continue
+        try:
+            wavelength = float(row[0])
+            value = float(row[1])
+            third = float(row[2]) if len(row) >= 3 and row[2] else None
+        except ValueError:
+            continue
+        if third is not None and current_section in {None, "legacy"}:
+            legacy.append((wavelength, value, third))
+        elif current_section is not None:
+            sections[current_section].append((wavelength, value))
+
+    if legacy:
+        wavelength, n_values, k_values = np.asarray(legacy, dtype=float).T
+    elif sections["n"] and sections["k"]:
+        n_data = np.asarray(sections["n"], dtype=float)
+        k_data = np.asarray(sections["k"], dtype=float)
+        n_data = n_data[np.argsort(n_data[:, 0])]
+        k_data = k_data[np.argsort(k_data[:, 0])]
+        wavelength = n_data[:, 0]
+        n_values = n_data[:, 1]
+        k_values = np.interp(wavelength, k_data[:, 0], k_data[:, 1])
+    else:
+        raise ValueError("Si data require wavelength,n,k columns or separate wl,n / wl,k sections")
+
+    if np.nanmedian(wavelength) < 10.0:
+        wavelength = wavelength * 1000.0
+    return wavelength, n_values, k_values
+
+class MaterialLoader:
+    def __init__(self, si_csv_path):
+        self._init_si_interpolation(si_csv_path)
+
+    def _init_si_interpolation(self, csv_path):
+        """
+        读取 Si 的 CSV 文件并创建插值函数
+        假设 CSV 列顺序: Wavelength(um), n, k
+        """
+        # 读取数据 (根据你的csv是否有表头header，可能需要调整 header=None 或 header=0)
+        # 假设你的csv第一行是数据，没有标题，则 header=None
+        lam_nm, n_vals, k_vals = read_si_optical_constants(csv_path)
+
+        # 创建插值函数 (处理 TMM 计算时波长点和 CSV 不对齐的问题)
+        # fill_value="extrapolate" 防止波长稍微超出一点点导致报错
+        order = np.argsort(lam_nm)
+        lam_nm = lam_nm[order]
+        self.si_wavelength_range = (float(lam_nm[0]), float(lam_nm[-1]))
+        self.si_n_interp = PchipInterpolator(lam_nm, n_vals[order], extrapolate=False)
+        self.si_k_interp = PchipInterpolator(lam_nm, k_vals[order], extrapolate=False)
+        self.si_n_edge_slopes = tuple(
+            float(self.si_n_interp.derivative()(edge)) for edge in self.si_wavelength_range
+        )
+        self.si_k_edge_slopes = tuple(
+            float(self.si_k_interp.derivative()(edge)) for edge in self.si_wavelength_range
+        )
+
+    def _evaluate_si_component(self, wavelengths_nm, interpolation, edge_slopes):
+        lower, upper = self.si_wavelength_range
+        clipped = np.clip(wavelengths_nm, lower, upper)
+        values = interpolation(clipped)
+        lower_value = float(interpolation(lower))
+        upper_value = float(interpolation(upper))
+        values = np.where(
+            wavelengths_nm < lower,
+            lower_value + edge_slopes[0] * (wavelengths_nm - lower),
+            values,
+        )
+        return np.where(
+            wavelengths_nm > upper,
+            upper_value + edge_slopes[1] * (wavelengths_nm - upper),
+            values,
+        )
+
+    def get_si_n(self, lam_nm):
+        """
+        获取 Si 的复折射率 (298 K)
+        输入: 波长 (nm), 支持标量或 numpy 数组
+        """
+        lam_nm = np.asarray(lam_nm, dtype=float)
+        if np.any(~np.isfinite(lam_nm)) or np.any(lam_nm <= 0):
+            raise ValueError("Si wavelengths must be finite and positive")
+        n = self._evaluate_si_component(lam_nm, self.si_n_interp, self.si_n_edge_slopes)
+        k = self._evaluate_si_component(lam_nm, self.si_k_interp, self.si_k_edge_slopes)
+        n = np.maximum(n, np.finfo(float).eps)
+        return n + 1j * np.maximum(k, 0.0)
+
+    def get_si_n_with_temp(self, lam_nm, temp_k):
+        """
+        获取给定温度下的 Si 折射率
+        基于 25 C (298 K) 和 10 K 的差值模型进行线性插值
+        Delta n formula provided by user.
+        """
+        if not 10.0 <= temp_k <= 300.0:
+            raise ValueError("Si temperature correction is calibrated only for 10-300 K")
+        # 1. Start with base (298 K)
+        n_base = self.get_si_n(lam_nm)
+
+        # 2. Calculate 10K difference (n)
+        # Delta n (10K vs 298K) = 0.02514 + 0.00850 / (lam^2 - 0.10165)
+        # Assuming lam in microns
+        lam_um = lam_nm / 1000.0
+        delta_n_abs = 0.02514 + 0.00850 / (lam_um**2 - 0.10165)
+
+        # 3. Calculate 10K difference (k)
+        # Delta k (10K vs 298K) = A * exp(-B * lam) + C
+        # A = 270.16, B = 18.91, C = 0.0029
+        delta_k_abs = 270.16 * np.exp(-18.91 * lam_um) + 0.0029
+
+        # 4. Interpolate
+        # If T = 298, correction = 0
+        # If T = 10, correction = -delta_n_abs (Assuming params decrease with T)
+        ratio = (298.0 - temp_k) / (298.0 - 10.0)
+
+        correction_n = ratio * delta_n_abs
+        correction_k = ratio * delta_k_abs
+
+        n_real = np.real(n_base) - correction_n
+        n_imag = np.maximum(np.imag(n_base) - correction_k, 0.0)
+
+        return n_real + 1j * n_imag
+
+    def get_sio2_n(self, lam_nm):
+        """
+        利用 Sellmeier 方程计算 SiO2 折射率
+        输入: 波长 (nm)
+        """
+        # 1. 单位转换: nm -> um (因为 Sellmeier 公式里的 x 通常是微米)
+        x = lam_nm / 1000.0
+
+        # 2. 你的公式
+        # 注意：公式里的项是 (C/x)**2，确保分母不为0
+        term1 = 0.9310 / (1 - (0.079 / x)**2)
+        term2 = 0.1735 / (1 - (0.130 / x)**2)
+        term3 = 2.1121 / (1 - (14.918 / x)**2)
+
+        n_squared = 1 + term1 + term2 + term3
+        n = np.sqrt(n_squared)
+
+        # 3. 虚部 k 设为 0
+        return n + 0j
+
+    def get_hbn_n(self, lam_nm):
+        """
+        计算 hBN 折射率 (Ordinary ray, in-plane)
+        Source: S.-Y. Lee et al., Phys. Status Solidi B 256, 1800417 (2018).
+        适用范围: 可见光到近红外
+        """
+        lam_um = lam_nm / 1000.0  # 必须转换为微米
+
+        # Lee et al. (2018) 实验拟合参数:
+        # A = 3.263 (也有文献给 3.336)
+        # B = 0.1644^2 (也有文献给 0.162^2)
+
+        # 避免分母为0或负数 (虽然在可见光段不会发生)
+        denom = lam_um**2 - 0.1644**2
+
+        # Sellmeier Equation: n^2 = 1 + A * lam^2 / (lam^2 - B^2)
+        n_squared = 1 + (3.263 * lam_um**2) / denom
+
+        return np.sqrt(n_squared) + 0j
+
+    def get_quartz_n(self, lam_nm):
+        """
+        Quartz (Fused Silica) 折射率
+        直接复用 SiO2 Sellmeier 方程
+        """
+        return self.get_sio2_n(lam_nm)
+
+    def get_sapphire_n(self, lam_nm):
+        """
+        Sapphire (Al2O3) Refractive Index (Ordinary Ray)
+        Formula:
+        n^2 = 1 + 1.4313493/(1-(0.0726631/x)^2) + 0.65054713/(1-(0.1193242/x)^2) + 5.3414021/(1-(18.028251/x)^2)
+        (x in microns)
+        """
+        x = lam_nm / 1000.0 # Convert to microns
+
+        # Sellmeier Equation Terms
+        # Using the provided coefficients
+        # A1=1.4313493, B1=0.0726631
+        # A2=0.65054713, B2=0.1193242
+        # A3=5.3414021, B3=18.028251
+
+        term1 = 1.4313493 / (1 - (0.0726631 / x)**2)
+        term2 = 0.65054713/ (1 - (0.1193242 / x)**2)
+        term3 = 5.3414021 / (1 - (18.028251 / x)**2)
+
+        n_squared = 1 + term1 + term2 + term3
+        n = np.sqrt(n_squared)
+
+        return n + 0j
+
+    def get_tio2_n(self, lam_nm):
+        """
+        TiO2 Refractive Index
+        Formula: n = sqrt(5.913 + 0.2441 / (x^2 - 0.0803))
+        (x in microns)
+        """
+        x = lam_nm / 1000.0 # Convert to microns
+
+        # Formula provided by user
+        n_squared = 5.913 + 0.2441 / (x**2 - 0.0803)
+        n = np.sqrt(n_squared)
+
+        return n + 0j
+
+# === 使用示例 ===
+if __name__ == "__main__":
+    # 假设你的 csv 文件名为 'Si_data.csv'
+    # 请确保你的 csv 路径正确
+    try:
+        loader = MaterialLoader('Si_data.csv')
+
+        # 测试 532 nm (绿光) 下的折射率
+        test_wav = 532.0
+        n_si = loader.get_si_n(test_wav)
+        n_sio2 = loader.get_sio2_n(test_wav)
+
+        print(f"波长: {test_wav} nm")
+        print(f"Si   折射率: {n_si:.6f}")  # 应该会有较大的虚部
+        print(f"SiO2 折射率: {n_sio2:.6f}") # 虚部应该是 0j
+
+    except Exception as e:
+        print(f"加载失败，请检查 CSV 路径。错误: {e}")
+`;
+
+        const schinkeDataContent = `wl,n
+0.25,1.637
+0.26,1.737
+0.27,2.030
+0.28,2.840
+0.29,4.185
+0.30,5.049
+0.31,5.091
+0.32,5.085
+0.33,5.135
+0.34,5.245
+0.35,5.423
+0.36,5.914
+0.37,6.820
+0.38,6.587
+0.39,6.025
+0.40,5.623
+0.41,5.341
+0.42,5.110
+0.43,4.932
+0.44,4.790
+0.45,4.673
+0.46,4.572
+0.47,4.485
+0.48,4.412
+0.49,4.349
+0.50,4.289
+0.51,4.235
+0.52,4.187
+0.53,4.145
+0.54,4.103
+0.55,4.073
+0.56,4.038
+0.57,4.006
+0.58,3.977
+0.59,3.954
+0.60,3.931
+0.61,3.908
+0.62,3.888
+0.63,3.869
+0.64,3.851
+0.65,3.835
+0.66,3.817
+0.67,3.805
+0.68,3.791
+0.69,3.776
+0.70,3.765
+0.71,3.753
+0.72,3.741
+0.73,3.730
+0.74,3.719
+0.75,3.712
+0.76,3.701
+0.77,3.693
+0.78,3.684
+0.79,3.677
+0.80,3.669
+0.81,3.662
+0.82,3.655
+0.83,3.646
+0.84,3.641
+0.85,3.636
+0.86,3.628
+0.87,3.622
+0.88,3.617
+0.89,3.613
+0.90,3.610
+0.91,3.604
+0.92,3.598
+0.93,3.597
+0.94,3.590
+0.95,3.584
+0.96,3.584
+0.97,3.578
+0.98,3.582
+0.99,3.579
+1.00,3.575
+1.01,3.572
+1.02,3.568
+1.03,3.565
+1.04,3.562
+1.05,3.559
+1.06,3.556
+1.07,3.553
+1.08,3.549
+1.09,3.547
+1.10,3.545
+1.11,3.542
+1.12,3.540
+1.13,3.537
+1.14,3.534
+1.15,3.533
+1.16,3.530
+1.17,3.527
+1.18,3.526
+1.19,3.524
+1.20,3.522
+1.21,3.520
+1.22,3.518
+1.23,3.517
+1.24,3.515
+1.25,3.513
+1.26,3.512
+1.27,3.509
+1.28,3.509
+1.29,3.506
+1.30,3.505
+1.31,3.503
+1.32,3.502
+1.33,3.501
+1.34,3.500
+1.35,3.499
+1.36,3.497
+1.37,3.496
+1.38,3.496
+1.39,3.496
+1.40,3.493
+1.41,3.492
+1.42,3.492
+1.43,3.490
+1.44,3.488
+1.45,3.487
+
+wl,k
+0.25,3.5889E+00
+0.26,3.9932E+00
+0.27,4.5958E+00
+0.28,5.1961E+00
+0.29,5.3124E+00
+0.30,4.2900E+00
+0.31,3.6239E+00
+0.32,3.2824E+00
+0.33,3.0935E+00
+0.34,2.9573E+00
+0.35,2.9078E+00
+0.36,2.9135E+00
+0.37,2.1403E+00
+0.38,9.8399E-01
+0.39,5.0308E-01
+0.40,3.2627E-01
+0.41,2.4127E-01
+0.42,1.7694E-01
+0.43,1.3766E-01
+0.44,1.1201E-01
+0.45,9.5362E-02
+0.46,7.9105E-02
+0.47,7.0240E-02
+0.48,5.9817E-02
+0.49,5.3810E-02
+0.50,4.8542E-02
+0.51,4.3831E-02
+0.52,3.9531E-02
+0.53,3.4804E-02
+0.54,2.9896E-02
+0.55,2.8038E-02
+0.56,2.6551E-02
+0.57,2.3746E-02
+0.58,2.1896E-02
+0.59,2.0076E-02
+0.60,1.8521E-02
+0.61,1.7257E-02
+0.62,1.6809E-02
+0.63,1.6268E-02
+0.64,1.4693E-02
+0.65,1.4447E-02
+0.66,1.3608E-02
+0.67,1.2807E-02
+0.68,1.2045E-02
+0.69,1.1317E-02
+0.70,1.0623E-02
+0.71,9.9610E-03
+0.72,9.3335E-03
+0.73,8.7312E-03
+0.74,8.1618E-03
+0.75,7.6156E-03
+0.76,7.0942E-03
+0.77,6.6054E-03
+0.78,6.1338E-03
+0.79,5.6888E-03
+0.80,5.2655E-03
+0.81,4.8640E-03
+0.82,4.4836E-03
+0.83,4.1235E-03
+0.84,3.7828E-03
+0.85,3.4605E-03
+0.86,3.1563E-03
+0.87,2.8697E-03
+0.88,2.6001E-03
+0.89,2.3464E-03
+0.90,2.1092E-03
+0.91,1.8864E-03
+0.92,1.6787E-03
+0.93,1.4757E-03
+0.94,1.3061E-03
+0.95,1.1393E-03
+0.96,9.8243E-04
+0.97,8.4060E-04
+0.98,7.1334E-04
+0.99,5.9638E-04
+1.00,4.9020E-04
+1.01,3.9616E-04
+1.02,3.1437E-04
+1.03,2.4048E-04
+1.04,1.7959E-04
+1.05,1.3043E-04
+1.06,9.2450E-05
+1.07,6.7820E-05
+1.08,5.2168E-05
+1.09,3.9770E-05
+1.10,3.0217E-05
+1.11,2.2913E-05
+1.12,1.7068E-05
+1.13,1.2382E-05
+1.14,8.6210E-06
+1.15,5.6876E-06
+1.16,3.4275E-06
+1.17,1.7653E-06
+1.18,5.5561E-07
+1.19,2.3153E-07
+1.20,1.3904E-07
+1.21,8.0863E-08
+1.22,4.7940E-08
+1.23,2.7132E-08
+1.24,1.4318E-08
+1.25,5.8798E-09
+1.26,2.3352E-09
+1.27,1.2714E-09
+1.28,7.5284E-10
+1.29,4.4799E-10
+1.30,2.7228E-10
+1.31,1.5856E-10
+1.32,8.7196E-11
+1.33,4.2039E-11
+1.34,1.8128E-11
+1.35,1.0428E-11
+1.36,6.2911E-12
+1.37,3.9030E-12
+1.38,2.6367E-12
+1.39,1.7377E-12
+1.40,1.0428E-12
+1.41,6.0422E-13
+1.42,4.2895E-13
+1.43,2.0381E-13
+1.44,1.3785E-13
+1.45,1.0901E-13
+`;
+
+        const greenDataContent = `wl,n
+2.5000e-01,1.6650e+00
+2.6000e-01,1.7570e+00
+2.7000e-01,2.0680e+00
+2.8000e-01,2.9590e+00
+2.9000e-01,4.3560e+00
+3.0000e-01,4.9760e+00
+3.1000e-01,5.1210e+00
+3.2000e-01,5.1120e+00
+3.3000e-01,5.1950e+00
+3.4000e-01,5.3010e+00
+3.5000e-01,5.4940e+00
+3.6000e-01,6.0260e+00
+3.7000e-01,6.8910e+00
+3.8000e-01,6.6160e+00
+3.9000e-01,6.0390e+00
+4.0000e-01,5.6130e+00
+4.1000e-01,5.3300e+00
+4.2000e-01,5.1190e+00
+4.3000e-01,4.9490e+00
+4.4000e-01,4.8120e+00
+4.5000e-01,4.6910e+00
+4.6000e-01,4.5870e+00
+4.7000e-01,4.4970e+00
+4.8000e-01,4.4190e+00
+4.9000e-01,4.3500e+00
+5.0000e-01,4.2940e+00
+5.1000e-01,4.2410e+00
+5.2000e-01,4.1930e+00
+5.3000e-01,4.1510e+00
+5.4000e-01,4.1120e+00
+5.5000e-01,4.0770e+00
+5.6000e-01,4.0450e+00
+5.7000e-01,4.0150e+00
+5.8000e-01,3.9880e+00
+5.9000e-01,3.9630e+00
+6.0000e-01,3.9400e+00
+6.1000e-01,3.9180e+00
+6.2000e-01,3.8980e+00
+6.3000e-01,3.8790e+00
+6.4000e-01,3.8610e+00
+6.5000e-01,3.8440e+00
+6.6000e-01,3.8280e+00
+6.7000e-01,3.8130e+00
+6.8000e-01,3.7980e+00
+6.9000e-01,3.7840e+00
+7.0000e-01,3.7720e+00
+7.1000e-01,3.7590e+00
+7.2000e-01,3.7480e+00
+7.3000e-01,3.7370e+00
+7.4000e-01,3.7270e+00
+7.5000e-01,3.7170e+00
+7.6000e-01,3.7080e+00
+7.7000e-01,3.6990e+00
+7.8000e-01,3.6910e+00
+7.9000e-01,3.6830e+00
+8.0000e-01,3.6750e+00
+8.1000e-01,3.6680e+00
+8.2000e-01,3.6610e+00
+8.3000e-01,3.6540e+00
+8.4000e-01,3.6470e+00
+8.5000e-01,3.6410e+00
+8.6000e-01,3.6350e+00
+8.7000e-01,3.6300e+00
+8.8000e-01,3.6240e+00
+8.9000e-01,3.6190e+00
+9.0000e-01,3.6140e+00
+9.1000e-01,3.6090e+00
+9.2000e-01,3.6040e+00
+9.3000e-01,3.6000e+00
+9.4000e-01,3.5950e+00
+9.5000e-01,3.5910e+00
+9.6000e-01,3.5870e+00
+9.7000e-01,3.5830e+00
+9.8000e-01,3.5790e+00
+9.9000e-01,3.5750e+00
+1.0000e+00,3.5720e+00
+1.0100e+00,3.5680e+00
+1.0200e+00,3.5650e+00
+1.0300e+00,3.5620e+00
+1.0400e+00,3.5590e+00
+1.0500e+00,3.5560e+00
+1.0600e+00,3.5530e+00
+1.0700e+00,3.5500e+00
+1.0800e+00,3.5470e+00
+1.0900e+00,3.5450e+00
+1.1000e+00,3.5420e+00
+1.1100e+00,3.5400e+00
+1.1200e+00,3.5370e+00
+1.1300e+00,3.5350e+00
+1.1400e+00,3.5320e+00
+1.1500e+00,3.5300e+00
+1.1600e+00,3.5280e+00
+1.1700e+00,3.5260e+00
+1.1800e+00,3.5240e+00
+1.1900e+00,3.5220e+00
+1.2000e+00,3.5200e+00
+1.2100e+00,3.5180e+00
+1.2200e+00,3.5170e+00
+1.2300e+00,3.5150e+00
+1.2400e+00,3.5130e+00
+1.2500e+00,3.5110e+00
+1.2600e+00,3.5090e+00
+1.2700e+00,3.5080e+00
+1.2800e+00,3.5060e+00
+1.2900e+00,3.5050e+00
+1.3000e+00,3.5030e+00
+1.3100e+00,3.5020e+00
+1.3200e+00,3.5000e+00
+1.3300e+00,3.4990e+00
+1.3400e+00,3.4970e+00
+1.3500e+00,3.4960e+00
+1.3600e+00,3.4950e+00
+1.3700e+00,3.4940e+00
+1.3800e+00,3.4920e+00
+1.3900e+00,3.4910e+00
+1.4000e+00,3.4900e+00
+1.4100e+00,3.4890e+00
+1.4200e+00,3.4880e+00
+1.4300e+00,3.4870e+00
+1.4400e+00,3.4860e+00
+1.4500e+00,3.4850e+00
+
+wl,k
+2.5000e-01,3.6650e+00
+2.6000e-01,4.0840e+00
+2.7000e-01,4.6800e+00
+2.8000e-01,5.2870e+00
+2.9000e-01,5.2860e+00
+3.0000e-01,4.2340e+00
+3.1000e-01,3.5980e+00
+3.2000e-01,3.3030e+00
+3.3000e-01,3.1000e+00
+3.4000e-01,2.9770e+00
+3.5000e-01,2.9380e+00
+3.6000e-01,2.9660e+00
+3.7000e-01,2.1710e+00
+3.8000e-01,9.4600e-01
+3.9000e-01,4.4500e-01
+4.0000e-01,2.9600e-01
+4.1000e-01,2.2700e-01
+4.2000e-01,1.7600e-01
+4.3000e-01,1.3800e-01
+4.4000e-01,1.0700e-01
+4.5000e-01,8.6302e-02
+4.6000e-01,7.1381e-02
+4.7000e-01,6.2086e-02
+4.8000e-01,5.5004e-02
+4.9000e-01,4.9131e-02
+5.0000e-01,4.4165e-02
+5.1000e-01,3.9367e-02
+5.2000e-01,3.6415e-02
+5.3000e-01,3.3108e-02
+5.4000e-01,3.0295e-02
+5.5000e-01,2.7968e-02
+5.6000e-01,2.5758e-02
+5.7000e-01,2.4131e-02
+5.8000e-01,2.2524e-02
+5.9000e-01,2.1081e-02
+6.0000e-01,1.9934e-02
+6.1000e-01,1.8446e-02
+6.2000e-01,1.7367e-02
+6.3000e-01,1.6444e-02
+6.4000e-01,1.5432e-02
+6.5000e-01,1.4431e-02
+6.6000e-01,1.3498e-02
+6.7000e-01,1.2743e-02
+6.8000e-01,1.1905e-02
+6.9000e-01,1.1201e-02
+7.0000e-01,1.0528e-02
+7.1000e-01,1.0057e-02
+7.2000e-01,9.6257e-03
+7.3000e-01,8.9461e-03
+7.4000e-01,8.3620e-03
+7.5000e-01,7.8185e-03
+7.6000e-01,7.1970e-03
+7.7000e-01,6.7402e-03
+7.8000e-01,6.3933e-03
+7.9000e-01,5.8340e-03
+8.0000e-01,5.4113e-03
+8.1000e-01,4.9955e-03
+8.2000e-01,4.6134e-03
+8.3000e-01,4.2734e-03
+8.4000e-01,3.9439e-03
+8.5000e-01,3.6120e-03
+8.6000e-01,3.2781e-03
+8.7000e-01,2.9839e-03
+8.8000e-01,2.6821e-03
+8.9000e-01,2.4293e-03
+9.0000e-01,2.1701e-03
+9.1000e-01,1.9625e-03
+9.2000e-01,1.7571e-03
+9.3000e-01,1.5467e-03
+9.4000e-01,1.3689e-03
+9.5000e-01,1.1793e-03
+9.6000e-01,1.0237e-03
+9.7000e-01,8.7225e-04
+9.8000e-01,7.4866e-04
+9.9000e-01,6.2238e-04
+1.0000e+00,5.0930e-04
+1.0100e+00,4.1071e-04
+1.0200e+00,3.2386e-04
+1.0300e+00,2.4753e-04
+1.0400e+00,1.8704e-04
+1.0500e+00,1.3620e-04
+1.0600e+00,9.3631e-05
+1.0700e+00,6.8118e-05
+1.0800e+00,5.3285e-05
+1.0900e+00,4.0768e-05
+1.1000e+00,3.0637e-05
+1.1100e+00,2.3849e-05
+1.1200e+00,1.7825e-05
+1.1300e+00,1.3488e-05
+1.1400e+00,9.0718e-06
+1.1500e+00,6.2230e-06
+1.1600e+00,3.8770e-06
+1.1700e+00,2.0483e-06
+1.1800e+00,6.1036e-07
+1.1900e+00,3.4091e-07
+1.2000e+00,2.1008e-07
+1.2100e+00,1.2518e-07
+1.2200e+00,7.9609e-08
+1.2300e+00,4.6004e-08
+1.2400e+00,2.3682e-08
+1.2500e+00,9.9472e-09
+1.2600e+00,3.6096e-09
+1.2700e+00,2.0213e-09
+1.2800e+00,1.2223e-09
+1.2900e+00,7.2885e-10
+1.3000e+00,4.6553e-10
+1.3100e+00,2.8147e-10
+1.3200e+00,1.6807e-10
+1.3300e+00,8.4670e-11
+1.3400e+00,3.7322e-11
+1.3500e+00,1.8263e-11
+1.3600e+00,1.0281e-11
+1.3700e+00,6.5413e-12
+1.3800e+00,4.1730e-12
+1.3900e+00,2.5441e-12
+1.4000e+00,1.5597e-12
+1.4100e+00,9.5374e-13
+1.4200e+00,5.6500e-13
+1.4300e+00,2.8449e-13
+1.4400e+00,2.0626e-13
+1.4500e+00,1.3846e-13
 `;
 
         const siDataContent = `0.4,5.49655367,0.285170605
@@ -836,7 +2484,8 @@ with col2:
 1.2653,3.50588804,2.62879E-4
 1.2784,3.50379358,2.31383E-4
 1.2917,3.50172508,2.02311E-4
-1.3053,3.4996808,1.75769E-4`;
+1.3053,3.4996808,1.75769E-4
+`;
 
         stlite.mount(
             {
@@ -844,6 +2493,11 @@ with col2:
                 entrypoint: "streamlit_app.py",
                 files: {
                     "streamlit_app.py": streamlitAppContent,
+                    "optical_model.py": opticalModelContent,
+                    "fitting_engine.py": fittingEngineContent,
+                    "materials.py": materialsContent,
+                    "Schinke.csv": schinkeDataContent,
+                    "Green-2008.csv": greenDataContent,
                     "Si_data.csv": siDataContent
                 },
             },

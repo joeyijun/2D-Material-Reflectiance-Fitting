@@ -1,6 +1,63 @@
 import numpy as np
-import pandas as pd
-from scipy.interpolate import interp1d
+import csv
+import io
+from pathlib import Path
+from scipy.interpolate import PchipInterpolator
+
+
+def read_si_optical_constants(source):
+    """Read numeric wavelength,n,k data or separate wl,n and wl,k sections."""
+    if hasattr(source, "read"):
+        if hasattr(source, "seek"):
+            source.seek(0)
+        content = source.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8-sig")
+    else:
+        content = Path(source).read_text(encoding="utf-8-sig")
+
+    legacy = []
+    sections = {"n": [], "k": []}
+    current_section = None
+    for row in csv.reader(io.StringIO(content)):
+        row = [cell.strip() for cell in row]
+        if len(row) < 2 or not row[0]:
+            continue
+        first = row[0].lower()
+        second = row[1].lower()
+        if first in {"wl", "wavelength", "lambda", "wavelength_um", "wavelength_nm"}:
+            third_header = row[2].lower() if len(row) >= 3 else ""
+            current_section = "legacy" if second == "n" and third_header == "k" else (
+                second if second in sections else None
+            )
+            continue
+        try:
+            wavelength = float(row[0])
+            value = float(row[1])
+            third = float(row[2]) if len(row) >= 3 and row[2] else None
+        except ValueError:
+            continue
+        if third is not None and current_section in {None, "legacy"}:
+            legacy.append((wavelength, value, third))
+        elif current_section is not None:
+            sections[current_section].append((wavelength, value))
+
+    if legacy:
+        wavelength, n_values, k_values = np.asarray(legacy, dtype=float).T
+    elif sections["n"] and sections["k"]:
+        n_data = np.asarray(sections["n"], dtype=float)
+        k_data = np.asarray(sections["k"], dtype=float)
+        n_data = n_data[np.argsort(n_data[:, 0])]
+        k_data = k_data[np.argsort(k_data[:, 0])]
+        wavelength = n_data[:, 0]
+        n_values = n_data[:, 1]
+        k_values = np.interp(wavelength, k_data[:, 0], k_data[:, 1])
+    else:
+        raise ValueError("Si data require wavelength,n,k columns or separate wl,n / wl,k sections")
+
+    if np.nanmedian(wavelength) < 10.0:
+        wavelength = wavelength * 1000.0
+    return wavelength, n_values, k_values
 
 class MaterialLoader:
     def __init__(self, si_csv_path):
@@ -13,26 +70,51 @@ class MaterialLoader:
         """
         # 读取数据 (根据你的csv是否有表头header，可能需要调整 header=None 或 header=0)
         # 假设你的csv第一行是数据，没有标题，则 header=None
-        df = pd.read_csv(csv_path, header=None, names=['lam_um', 'n', 'k'])
-        
-        # 将微米转换为纳米，统一单位
-        lam_nm = df['lam_um'].values * 1000.0
-        n_vals = df['n'].values
-        k_vals = df['k'].values
+        lam_nm, n_vals, k_vals = read_si_optical_constants(csv_path)
         
         # 创建插值函数 (处理 TMM 计算时波长点和 CSV 不对齐的问题)
         # fill_value="extrapolate" 防止波长稍微超出一点点导致报错
-        self.si_n_interp = interp1d(lam_nm, n_vals, kind='cubic', fill_value="extrapolate")
-        self.si_k_interp = interp1d(lam_nm, k_vals, kind='cubic', fill_value="extrapolate")
+        order = np.argsort(lam_nm)
+        lam_nm = lam_nm[order]
+        self.si_wavelength_range = (float(lam_nm[0]), float(lam_nm[-1]))
+        self.si_n_interp = PchipInterpolator(lam_nm, n_vals[order], extrapolate=False)
+        self.si_k_interp = PchipInterpolator(lam_nm, k_vals[order], extrapolate=False)
+        self.si_n_edge_slopes = tuple(
+            float(self.si_n_interp.derivative()(edge)) for edge in self.si_wavelength_range
+        )
+        self.si_k_edge_slopes = tuple(
+            float(self.si_k_interp.derivative()(edge)) for edge in self.si_wavelength_range
+        )
+
+    def _evaluate_si_component(self, wavelengths_nm, interpolation, edge_slopes):
+        lower, upper = self.si_wavelength_range
+        clipped = np.clip(wavelengths_nm, lower, upper)
+        values = interpolation(clipped)
+        lower_value = float(interpolation(lower))
+        upper_value = float(interpolation(upper))
+        values = np.where(
+            wavelengths_nm < lower,
+            lower_value + edge_slopes[0] * (wavelengths_nm - lower),
+            values,
+        )
+        return np.where(
+            wavelengths_nm > upper,
+            upper_value + edge_slopes[1] * (wavelengths_nm - upper),
+            values,
+        )
 
     def get_si_n(self, lam_nm):
         """
         获取 Si 的复折射率 (298 K)
         输入: 波长 (nm), 支持标量或 numpy 数组
         """
-        n = self.si_n_interp(lam_nm)
-        k = self.si_k_interp(lam_nm)
-        return n + 1j * k
+        lam_nm = np.asarray(lam_nm, dtype=float)
+        if np.any(~np.isfinite(lam_nm)) or np.any(lam_nm <= 0):
+            raise ValueError("Si wavelengths must be finite and positive")
+        n = self._evaluate_si_component(lam_nm, self.si_n_interp, self.si_n_edge_slopes)
+        k = self._evaluate_si_component(lam_nm, self.si_k_interp, self.si_k_edge_slopes)
+        n = np.maximum(n, np.finfo(float).eps)
+        return n + 1j * np.maximum(k, 0.0)
 
     def get_si_n_with_temp(self, lam_nm, temp_k):
         """
@@ -40,6 +122,8 @@ class MaterialLoader:
         基于 25 C (298 K) 和 10 K 的差值模型进行线性插值
         Delta n formula provided by user.
         """
+        if not 10.0 <= temp_k <= 300.0:
+            raise ValueError("Si temperature correction is calibrated only for 10-300 K")
         # 1. Start with base (298 K)
         n_base = self.get_si_n(lam_nm)
         
@@ -63,13 +147,7 @@ class MaterialLoader:
         correction_k = ratio * delta_k_abs
         
         n_real = np.real(n_base) - correction_n
-        n_imag = np.imag(n_base) - correction_k
-        
-        # Ensure k is not negative (physically impossible for passive material)
-        if np.isscalar(n_imag):
-            if n_imag < 0: n_imag = 0
-        else:
-            n_imag[n_imag < 0] = 0
+        n_imag = np.maximum(np.imag(n_base) - correction_k, 0.0)
         
         return n_real + 1j * n_imag
 
