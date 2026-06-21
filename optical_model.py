@@ -5,6 +5,89 @@ from scipy.special import wofz
 
 
 HC_EV_NM = 1239.8419843320026
+LAYER_MATERIALS = ("Sample", "hBN", "Graphene", "SiO2", "Quartz", "Sapphire", "TiO2")
+
+
+def default_layer_stack(substrate_type="Si/SiO2"):
+    """Return a table-friendly top-to-bottom layer stack."""
+    layers = [{"material": "Sample", "thickness_nm": 0.65, "in_reference": False,
+               "fit": False, "min_nm": 0.1, "max_nm": 5.0}]
+    if substrate_type == "Si/SiO2":
+        layers.append({"material": "SiO2", "thickness_nm": 285.0, "in_reference": True,
+                       "fit": True, "min_nm": 265.0, "max_nm": 305.0})
+    return layers
+
+
+def normalized_layer_stack(config):
+    """Validate a layer table, or translate the legacy fixed-layer config."""
+    if "layers" in config:
+        layers = []
+        for row in config["layers"]:
+            material = str(row.get("material", "")).strip()
+            if material not in LAYER_MATERIALS:
+                raise ValueError(f"Unsupported layer material: {material}")
+            thickness = float(row.get("thickness_nm", 0.0))
+            lower = float(row.get("min_nm", 0.0))
+            upper = float(row.get("max_nm", max(thickness, 1.0)))
+            if not np.isfinite(thickness) or thickness < 0:
+                raise ValueError(f"Invalid {material} thickness")
+            if lower < 0 or upper <= lower or not lower <= thickness <= upper:
+                raise ValueError(f"Invalid fit bounds for {material}: {lower} <= {thickness} <= {upper}")
+            layers.append({
+                "material": material,
+                "thickness_nm": thickness,
+                "in_reference": False if material == "Sample" else bool(
+                    row.get("in_reference", True)
+                ),
+                "fit": bool(row.get("fit", False)),
+                "min_nm": lower,
+                "max_nm": upper,
+            })
+        if sum(layer["material"] == "Sample" for layer in layers) != 1:
+            raise ValueError("The layer stack must contain exactly one Sample row")
+        return layers
+
+    layers = []
+    reference_hbn = bool(config.get("reference_includes_hbn", False))
+    if config.get("has_top_hbn", False):
+        value = float(config.get("top_hbn_thick", 10.0))
+        layers.append({"material": "hBN", "thickness_nm": value,
+                       "in_reference": reference_hbn, "fit": False,
+                       "min_nm": 0.0, "max_nm": 100.0})
+    layers.append({"material": "Sample", "thickness_nm": float(config.get("sample_thick", 0.65)),
+                   "in_reference": False, "fit": False, "min_nm": 0.1, "max_nm": 5.0})
+    if config.get("has_bot_hbn", False):
+        value = float(config.get("bot_hbn_thick", 10.0))
+        layers.append({"material": "hBN", "thickness_nm": value,
+                       "in_reference": reference_hbn, "fit": False,
+                       "min_nm": 0.0, "max_nm": 100.0})
+    if config.get("substrate_type", "Si/SiO2") == "Si/SiO2":
+        value = float(config.get("sio2_thick", 285.0))
+        layers.append({"material": "SiO2", "thickness_nm": value,
+                       "in_reference": True, "fit": False,
+                       "min_nm": max(0.0, value - 20.0), "max_nm": value + 20.0})
+    return layers
+
+
+def layer_fit_parameters(config):
+    """Return (row index, value, lower, upper) for fitted layer thicknesses."""
+    return [
+        (index, row["thickness_nm"], row["min_nm"], row["max_nm"])
+        for index, row in enumerate(normalized_layer_stack(config)) if row["fit"]
+    ]
+
+
+def config_with_layer_thicknesses(config, fitted_values):
+    """Copy config and apply fitted thicknesses in table order."""
+    updated = dict(config)
+    layers = [dict(row) for row in normalized_layer_stack(config)]
+    fitted_rows = [index for index, row in enumerate(layers) if row["fit"]]
+    if len(fitted_values) != len(fitted_rows):
+        raise ValueError("Fitted layer-thickness count does not match the layer table")
+    for index, value in zip(fitted_rows, fitted_values):
+        layers[index]["thickness_nm"] = float(value)
+    updated["layers"] = layers
+    return updated
 
 
 def dielectric_func_lorentz(energy_ev, params):
@@ -72,7 +155,7 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
     n_2d = np.where(np.imag(n_2d) < 0, -n_2d, n_2d)
     substrate_type = config.get("substrate_type", "Si/SiO2")
 
-    if substrate_type == "Si/SiO2":
+    if substrate_type in ("Si/SiO2", "Si"):
         n_substrate = mat_loader.get_si_n_with_temp(
             wavelengths_nm, config.get("temp", 298.0)
         )
@@ -90,25 +173,30 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
         raise ValueError(f"Unsupported substrate type: {substrate_type}")
 
     n_substrate = np.broadcast_to(np.asarray(n_substrate, dtype=complex), wavelengths_nm.shape)
-    n_hbn = np.broadcast_to(
-        np.asarray(mat_loader.get_hbn_n(wavelengths_nm), dtype=complex),
-        wavelengths_nm.shape,
-    )
+    layer_rows = normalized_layer_stack(config)
 
-    def layer_stack(include_sample, include_hbn):
-        layers = []
-        if include_hbn and config.get("has_top_hbn", False):
-            layers.append((n_hbn, config.get("top_hbn_thick", 0.0)))
-        if include_sample:
-            layers.append((n_2d, config.get("sample_thick", 0.65)))
-        if include_hbn and config.get("has_bot_hbn", False):
-            layers.append((n_hbn, config.get("bot_hbn_thick", 0.0)))
-        if n_oxide is not None:
-            layers.append((n_oxide, config.get("sio2_thick", 285.0)))
-        return layers
+    def material_index(material):
+        if material == "Sample":
+            return n_2d
+        method_name = {
+            "hBN": "get_hbn_n", "Graphene": "get_graphene_n",
+            "SiO2": "get_sio2_n", "Quartz": "get_quartz_n",
+            "Sapphire": "get_sapphire_n", "TiO2": "get_tio2_n",
+        }[material]
+        return np.broadcast_to(
+            np.asarray(getattr(mat_loader, method_name)(wavelengths_nm), dtype=complex),
+            wavelengths_nm.shape,
+        )
 
-    def reflectance_at_angle(include_sample, include_hbn, sine_squared, polarization):
-        layers = layer_stack(include_sample, include_hbn)
+    def layer_stack(reference=False):
+        return [
+            (material_index(row["material"]), row["thickness_nm"])
+            for row in layer_rows
+            if not reference or row["in_reference"]
+        ]
+
+    def reflectance_at_angle(reference, sine_squared, polarization):
+        layers = layer_stack(reference)
         matrix = np.broadcast_to(np.eye(2, dtype=complex), (wavelengths_nm.size, 2, 2)).copy()
         for index, thickness_nm in layers:
             normal_wavevector = np.sqrt(index**2 - sine_squared + 0j)
@@ -152,12 +240,12 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
         amplitude = (incident_admittance - admittance) / (incident_admittance + admittance)
         return np.abs(amplitude) ** 2
 
-    def reflectance(include_sample, include_hbn):
+    def reflectance(reference):
         numerical_aperture = float(config.get("numerical_aperture", 0.0))
         if not 0.0 <= numerical_aperture < 1.0:
             raise ValueError("numerical_aperture must be in [0, 1)")
         if numerical_aperture == 0.0:
-            return reflectance_at_angle(include_sample, include_hbn, 0.0, "s")
+            return reflectance_at_angle(reference, 0.0, "s")
 
         # Uniform illumination of the objective pupil is uniform in sin(theta)^2.
         angular_points = max(2, int(config.get("angular_points", 7)))
@@ -166,16 +254,13 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
         normalized_weights = 0.5 * weights
         averaged = np.zeros(wavelengths_nm.shape, dtype=float)
         for value, weight in zip(sine_squared, normalized_weights):
-            reflectance_s = reflectance_at_angle(include_sample, include_hbn, value, "s")
-            reflectance_p = reflectance_at_angle(include_sample, include_hbn, value, "p")
+            reflectance_s = reflectance_at_angle(reference, value, "s")
+            reflectance_p = reflectance_at_angle(reference, value, "p")
             averaged += weight * 0.5 * (reflectance_s + reflectance_p)
         return averaged
 
-    sample_reflectance = reflectance(include_sample=True, include_hbn=True)
-    reference_reflectance = reflectance(
-        include_sample=False,
-        include_hbn=config.get("reference_includes_hbn", False),
-    )
+    sample_reflectance = reflectance(reference=False)
+    reference_reflectance = reflectance(reference=True)
     definition = config.get("contrast_definition", "relative")
     if definition == "symmetric":
         denominator = sample_reflectance + reference_reflectance

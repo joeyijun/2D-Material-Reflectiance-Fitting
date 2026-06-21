@@ -7,13 +7,20 @@ from fitting_engine import (
     finalize_physical_fit,
     fit_spectrum,
     guess_resonances,
+    resonance_balanced_sigma,
+    resonance_diagnostics,
+    resonance_windows_from_parameters,
 )
 from materials import read_si_optical_constants
 from optical_model import (
     HC_EV_NM,
+    LAYER_MATERIALS,
     calculate_contrast_dynamic as calculate_contrast_core,
+    config_with_layer_thicknesses,
     dielectric_func_lorentz as dielectric_func_lorentz_core,
     dielectric_func_voigt,
+    layer_fit_parameters,
+    normalized_layer_stack,
     spectral_derivative,
 )
 from scipy.interpolate import interp1d, PchipInterpolator
@@ -248,124 +255,108 @@ st.sidebar.subheader("Experimental Spectra")
 uploaded_sub_file = st.sidebar.file_uploader("Upload Substrate Spectrum (Ref)", type=["txt", "csv"])
 uploaded_samp_file = st.sidebar.file_uploader("Upload Sample Spectrum", type=["txt", "csv"])
 
-st.sidebar.subheader("Theoretical Model Data")
-# Configurable theoretical substrate file with default
-si_source = st.sidebar.selectbox(
-    "Si optical constants",
-    ["Si_data.csv", "Schinke.csv", "Green-2008.csv", "Upload custom..."],
-)
-use_custom_si = si_source == "Upload custom..."
-si_file = None
-loader = None
-
-if use_custom_si:
-    si_file = st.sidebar.file_uploader("Upload Substrate n,k Data (CSV)", type="csv")
-    if si_file:
-         loader = MaterialLoader(uploaded_si_file=si_file)
-else:
-    local_si_path = si_source
-    if os.path.exists(local_si_path):
-        st.sidebar.caption(f"Using default Si (n,k): {local_si_path}")
-        loader = MaterialLoader(si_filename=local_si_path)
-    else:
-        st.sidebar.warning("Default substrate n,k file (Si_data.csv) not found.")
-
+# Advanced optical settings remain code-level defaults for future use.
+si_source = "Si_data.csv"
+loader = MaterialLoader(si_filename=si_source) if os.path.exists(si_source) else None
 if loader is None or loader.si_n_interp is None:
-    if use_custom_si and not si_file:
-        st.sidebar.warning("Please upload a substrate n,k file.")
-    elif not use_custom_si:
-         st.sidebar.error("Default data missing. Please upload custom file.")
+    st.sidebar.error("Default Si optical data (Si_data.csv) is missing.")
     st.stop()
-
-# Sidebar - Structure
-st.sidebar.header("2. Structure Config")
-sub_type = st.sidebar.selectbox("Substrate", ["Si/SiO2", "Quartz", "Sapphire", "TiO2"])
-
-config = {
-    'substrate_type': sub_type,
-    'temp': 298.0,
-    'sio2_thick': 285.0,
-    'has_top_hbn': False,
-    'top_hbn_thick': 10.0,
-    'has_bot_hbn': False,
-    'bot_hbn_thick': 10.0,
-    'sample_thick': 0.65,
-    'numerical_aperture': 0.0,
-    'contrast_definition': 'relative'
-}
-
-if sub_type == "Si/SiO2":
-    inferred_oxide = 285.0
-    for uploaded in (uploaded_sub_file, uploaded_samp_file):
-        if uploaded is not None:
-            match = re.search(r"(\d+(?:\.\d+)?)\s*nm\s*SiO2", uploaded.name, re.IGNORECASE)
-            if match:
-                inferred_oxide = float(match.group(1))
-                break
-    spectrum_names = tuple(
-        uploaded.name if uploaded is not None else None
-        for uploaded in (uploaded_sub_file, uploaded_samp_file)
-    )
-    if st.session_state.get("oxide_inference_files") != spectrum_names:
-        st.session_state["sio2_thickness"] = inferred_oxide
-        st.session_state["oxide_inference_files"] = spectrum_names
-    config['sio2_thick'] = st.sidebar.number_input(
-        "SiO2 Thickness (nm)", key="sio2_thickness"
-    )
-    config['temp'] = st.sidebar.number_input(
-        "Temperature (K)", min_value=10.0, max_value=300.0, value=298.0
-    )
-
-config['numerical_aperture'] = st.sidebar.number_input(
-    "Illumination NA", min_value=0.0, max_value=0.95, value=0.0, step=0.05,
-    help="Effective filled-pupil illumination NA. Changing it invalidates the previous fit; 0 uses normal incidence."
-)
-
-config['fit_sio2_thickness'] = (
-    sub_type == "Si/SiO2"
-    and st.sidebar.checkbox("Fit SiO2 thickness (+/-20 nm)", value=True)
-)
 
 hbn_filename_hint = any(
     uploaded is not None and len(re.findall(r"hBN", uploaded.name, re.IGNORECASE)) >= 2
     for uploaded in (uploaded_sub_file, uploaded_samp_file)
 )
-config['has_top_hbn'] = st.sidebar.checkbox("Top hBN", value=hbn_filename_hint)
-if config['has_top_hbn']:
-    config['top_hbn_thick'] = st.sidebar.number_input("Top hBN Thickness (nm)", value=10.0)
+layer_presets = {
+    "Sample / SiO2 / Si": [
+        ["Sample", 0.65, False, False, 0.1, 2.0],
+        ["SiO2", 285.0, True, True, 265.0, 305.0],
+    ],
+    "hBN / Sample / hBN / SiO2 / Si": [
+        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["Sample", 0.65, False, False, 0.1, 2.0],
+        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["SiO2", 285.0, True, True, 265.0, 305.0],
+    ],
+    "hBN / Graphene / Sample / Graphene / hBN / SiO2 / Si": [
+        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["Graphene", 0.335, False, False, 0.1, 2.0],
+        ["Sample", 0.65, False, False, 0.1, 2.0],
+        ["Graphene", 0.335, False, False, 0.1, 2.0],
+        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["SiO2", 285.0, True, True, 265.0, 305.0],
+    ],
+}
+layer_columns = ["Order", "Material", "Thickness (nm)", "In reference", "Fit", "Min (nm)", "Max (nm)"]
 
-config['sample_thick'] = st.sidebar.number_input("Sample Thickness (nm)", value=0.65, format="%.2f")
 
-config['has_bot_hbn'] = st.sidebar.checkbox("Bottom hBN", value=hbn_filename_hint)
-if config['has_bot_hbn']:
-    config['bot_hbn_thick'] = st.sidebar.number_input("Bottom hBN Thickness (nm)", value=10.0)
-config['fit_hbn_thickness'] = st.sidebar.checkbox(
-    "Fit enabled hBN thicknesses (0-100 nm)",
-    value=hbn_filename_hint,
-    disabled=not (config['has_top_hbn'] or config['has_bot_hbn']),
-)
+def preset_layer_table(rows):
+    table = pd.DataFrame(rows, columns=layer_columns[1:])
+    table.insert(0, "Order", np.arange(1, len(table) + 1))
+    return table
 
-eps_inf = st.sidebar.number_input("Background Eps (Inf)", value=12.0)
-line_shape = st.sidebar.selectbox(
-    "Exciton line shape", ["Voigt / Faddeeva (Recommended)", "Lorentz"]
-)
+
+if "structure_layers" not in st.session_state:
+    initial_preset = list(layer_presets)[1 if hbn_filename_hint else 0]
+    st.session_state.structure_layers = preset_layer_table(layer_presets[initial_preset])
+
+st.header("2. Structure & Optical Model")
+structure_col, optics_col = st.columns([2, 1])
+with structure_col:
+    preset_col, apply_col = st.columns([4, 1])
+    selected_preset = preset_col.selectbox("Structure preset", list(layer_presets))
+    if apply_col.button("Apply", use_container_width=True):
+        st.session_state.structure_layers = preset_layer_table(layer_presets[selected_preset])
+    layer_df = st.data_editor(
+        st.session_state.structure_layers,
+        column_config={
+            "Order": st.column_config.NumberColumn("Order", min_value=1, step=1, required=True),
+            "Material": st.column_config.SelectboxColumn("Material", options=list(LAYER_MATERIALS), required=True),
+            "Thickness (nm)": st.column_config.NumberColumn(min_value=0.0, format="%.4f"),
+            "In reference": st.column_config.CheckboxColumn(help="Keep this layer in the reference-region stack"),
+            "Fit": st.column_config.CheckboxColumn(help="Fit this layer thickness"),
+            "Min (nm)": st.column_config.NumberColumn(min_value=0.0, format="%.4f"),
+            "Max (nm)": st.column_config.NumberColumn(min_value=0.0001, format="%.4f"),
+        },
+        num_rows="dynamic", use_container_width=True, hide_index=True,
+        key="layer_editor",
+    )
+    st.session_state.structure_layers = layer_df
+
+with optics_col:
+    sub_type = st.selectbox("Semi-infinite substrate", ["Si", "Quartz", "Sapphire", "TiO2"])
+    line_shape = st.selectbox(
+        "Exciton line shape", ["Voigt / Faddeeva (Recommended)", "Lorentz"]
+    )
+
+temperature = 298.0
+numerical_aperture = 0.0
+eps_inf = 12.0
+
+layers = [
+    {"material": row["Material"], "thickness_nm": row["Thickness (nm)"],
+     "in_reference": False if row["Material"] == "Sample" else row["In reference"],
+     "fit": row["Fit"],
+     "min_nm": row["Min (nm)"], "max_nm": row["Max (nm)"]}
+    for _, row in layer_df.sort_values("Order").iterrows()
+]
+config = {
+    'substrate_type': sub_type, 'temp': temperature, 'layers': layers,
+    'numerical_aperture': numerical_aperture, 'contrast_definition': 'relative'
+}
 config['line_shape'] = 'Voigt' if line_shape.startswith('Voigt') else 'Lorentz'
 
-model_signature = (
-    si_source,
-    config['substrate_type'],
-    round(float(config.get('sio2_thick', 0.0)), 8),
-    round(float(config.get('temp', 298.0)), 8),
-    round(float(config['numerical_aperture']), 8),
-    round(float(config['sample_thick']), 8),
-    bool(config['has_top_hbn']),
-    round(float(config.get('top_hbn_thick', 0.0)), 8),
-    bool(config['has_bot_hbn']),
-    round(float(config.get('bot_hbn_thick', 0.0)), 8),
-    bool(config['fit_sio2_thickness']),
-    bool(config['fit_hbn_thickness']),
-    config['line_shape'],
-)
+def make_model_signature(model_config):
+    return (
+        si_source,
+        model_config['substrate_type'],
+        round(float(model_config.get('temp', 298.0)), 8),
+        round(float(model_config['numerical_aperture']), 8),
+        tuple(tuple(sorted(row.items())) for row in model_config['layers']),
+        model_config['line_shape'],
+    )
+
+
+model_signature = make_model_signature(config)
 if 'fit_results' in st.session_state:
     stored = st.session_state.fit_results
     stored_signature = stored[5] if len(stored) >= 6 else None
@@ -460,13 +451,18 @@ fit_method = st.sidebar.selectbox("Method", [
     "1st Derivative + LM",
     "2nd Derivative + LM",
 ])
+e0_margin = 0.02
+baseline_order = 3
+max_nfev = st.sidebar.select_slider(
+    "Optimization budget", options=[3000, 8000, 15000], value=8000
+)
 config['fit_method'] = fit_method
 config['high_precision'] = (fit_method == "Global + Robust LM")
 
 
 
 # Main Content
-col1, col2 = st.columns([1, 1])
+col1, col2 = st.columns([3, 2])
 
 # Data processed earlier. Warning if errors are present not needed here if handled above/inline.
 # But process_experiments logic was moved up. The original block down here is now redundant/needs removal.
@@ -547,6 +543,11 @@ with col1:
     edited_df = st.data_editor(
         st.session_state.excitons, 
         column_config=column_config,
+        column_order=(
+            ["f", "🔒f", "E0", "🔒E0", "wL", "🔒wL", "wG", "🔒wG"]
+            if config['line_shape'] == 'Voigt'
+            else ["f", "🔒f", "E0", "🔒E0", "wL", "🔒wL"]
+        ),
         num_rows="dynamic", 
         use_container_width=True
     )
@@ -573,6 +574,11 @@ with col1:
             if len(x_fit_input) < 5:
                 st.error(f"Not enough data points in ROI ({roi_min}-{roi_max} eV). Loaded {len(x_exp_ev)} points.")
             else:
+                try:
+                    normalized_layer_stack(config)
+                except ValueError as exc:
+                    st.error(f"Invalid layer stack: {exc}")
+                    st.stop()
                 # Construct Initial Params
                 p0 = [eps_inf]
                 bounds_min = [0]
@@ -581,14 +587,28 @@ with col1:
                 
                 stride = 4 if config['line_shape'] == 'Voigt' else 3
                 for idx, row in edited_df.iterrows():
+                    if stride == 4:
+                        approximate_fwhm = (
+                            0.5346 * row['wL']
+                            + np.sqrt(0.2166 * row['wL'] ** 2 + row['wG'] ** 2)
+                        )
+                        width_upper = min(
+                            0.5,
+                            max(0.015, 4.0 * approximate_fwhm,
+                                1.25 * row['wL'], 1.25 * row['wG']),
+                        )
+                    else:
+                        approximate_fwhm = row['wL']
+                        width_upper = min(0.5, max(0.015, 4.0 * approximate_fwhm))
+                    local_e0_margin = min(e0_margin, max(0.004, 0.35 * approximate_fwhm))
                     values = [row['f'], row['E0'], row['wL']]
-                    lower = [0, max(0.1, row['E0'] - 0.02), 0.0001]
-                    upper = [50, row['E0'] + 0.02, 0.5]
+                    lower = [0, max(0.1, row['E0'] - local_e0_margin), 0.0001]
+                    upper = [50, row['E0'] + local_e0_margin, width_upper]
                     locks = [row['🔒f'], row['🔒E0'], row['🔒wL']]
                     if stride == 4:
                         values.append(row['wG'])
                         lower.append(0.0001)
-                        upper.append(0.5)
+                        upper.append(width_upper)
                         locks.append(row['🔒wG'])
                     p0.extend(values)
                     bounds_min.extend(lower)
@@ -614,17 +634,13 @@ with col1:
                     y_target = y_fit_exp
 
                 physical_count = len(p0)
-                structure_parameters = []
-                if config.get('fit_sio2_thickness', False):
-                    value = float(config['sio2_thick'])
-                    structure_parameters.append(('sio2_thick', value, max(0.0, value - 20.0), value + 20.0))
-                if config.get('fit_hbn_thickness', False):
-                    for enabled_key, thickness_key in (
-                        ('has_top_hbn', 'top_hbn_thick'), ('has_bot_hbn', 'bot_hbn_thick')
-                    ):
-                        if config.get(enabled_key, False):
-                            value = float(config[thickness_key])
-                            structure_parameters.append((thickness_key, value, 0.0, 100.0))
+                resonances = resonance_windows_from_parameters(
+                    p0, config['line_shape']
+                )
+                balanced_sigma = resonance_balanced_sigma(
+                    x_fit_ev_roi, y_fit_exp, resonances
+                )
+                structure_parameters = layer_fit_parameters(config)
                 for _, value, lower, upper in structure_parameters:
                     p0 = np.append(p0, value)
                     bounds = (
@@ -640,9 +656,10 @@ with col1:
                 )
 
                 def physical_model(params):
-                    model_config = config.copy()
-                    for offset, (key, _, _, _) in enumerate(structure_parameters):
-                        model_config[key] = params[physical_count + offset]
+                    model_config = config_with_layer_thicknesses(
+                        config,
+                        params[physical_count:physical_count + len(structure_parameters)],
+                    )
                     eps_2d = dielectric_model(x_fit_ev_roi, params[:physical_count])
                     return calculate_contrast_dynamic(x_fit_input, eps_2d, loader, model_config)
 
@@ -654,19 +671,25 @@ with col1:
                             contrast,
                             x_fit_ev_roi,
                             maximum_order=derivative_order,
+                            resonances=resonances,
                         )
                     return contrast
                 
                 try:
+                    progress_bar.progress(10, text="Validating layer stack and parameters...")
+                    normalized_layer_stack(config)
                     if config['high_precision']:
                         st.info("Running global initialization, robust TRF, and LM refinement...")
                     if derivative_order:
+                        progress_bar.progress(25, text="Warm-starting on the original spectrum...")
                         warm_result = fit_spectrum(
                             x_fit_ev_roi, y_fit_exp, physical_model, p0, bounds,
-                            locked_mask, baseline_order=3, robust=True,
-                            global_search=config['high_precision'], max_nfev=6000,
+                            locked_mask, baseline_order=baseline_order, robust=True,
+                            global_search=config['high_precision'], max_nfev=max_nfev,
+                            sigma=balanced_sigma,
                         )
                         p0 = warm_result.params
+                    progress_bar.progress(45, text="Optimizing optical and layer parameters...")
                     fit_result = fit_spectrum(
                         objective_energy,
                         y_target,
@@ -674,21 +697,29 @@ with col1:
                         p0,
                         bounds,
                         locked_mask,
-                        baseline_order=-1 if derivative_order else 3,
+                        baseline_order=-1 if derivative_order else baseline_order,
                         robust=True,
                         global_search=config['high_precision'] and not derivative_order,
-                        sigma=np.ones_like(y_target) if derivative_order else None,
-                        max_nfev=8000,
+                        sigma=np.ones_like(y_target) if derivative_order else balanced_sigma,
+                        max_nfev=max_nfev,
                     )
                     if not fit_result.success:
                         raise RuntimeError(fit_result.message)
                     
+                    progress_bar.progress(90, text="Calculating statistics and uncertainty...")
                     st.success("Fitting Complete!")
                     progress_bar.empty()
                     p_full_final = fit_result.params[:physical_count]
-                    fitted_config = config.copy()
-                    for offset, (key, _, _, _) in enumerate(structure_parameters):
-                        fitted_config[key] = float(fit_result.params[physical_count + offset])
+                    fitted_config = config_with_layer_thicknesses(
+                        config,
+                        fit_result.params[physical_count:physical_count + len(structure_parameters)],
+                    )
+                    st.session_state.structure_layers = pd.DataFrame([
+                        [index + 1, layer['material'], layer['thickness_nm'], layer['in_reference'],
+                         layer['fit'], layer['min_nm'], layer['max_nm']]
+                        for index, layer in enumerate(fitted_config['layers'])
+                    ], columns=layer_columns)
+                    st.session_state.pop("layer_editor", None)
                     epsilon_roi = dielectric_model(x_fit_ev_roi, p_full_final)
                     physical_roi = calculate_contrast_dynamic(
                         x_fit_input, epsilon_roi, loader, fitted_config
@@ -698,7 +729,11 @@ with col1:
                         x_fit_ev_roi,
                         y_fit_exp,
                         physical_roi,
-                        baseline_order=3,
+                        baseline_order=baseline_order,
+                        sigma=balanced_sigma,
+                    )
+                    fit_result.resonance_diagnostics = resonance_diagnostics(
+                        x_fit_ev_roi, y_fit_exp, fit_result.fitted, resonances
                     )
                     
                     # Update Excitons
@@ -723,7 +758,7 @@ with col1:
                         p_full_final,
                         fit_result,
                         fitted_config,
-                        model_signature,
+                        make_model_signature(fitted_config),
                     )
                     st.rerun()
                     
@@ -751,16 +786,22 @@ with col1:
             f"R2={fit_result.r_squared:.5f} | condition={fit_result.jacobian_condition:.3g} | "
             f"Durbin-Watson={fit_result.durbin_watson:.3f}"
         )
-        fitted_names = []
-        if fitted_config.get('fit_sio2_thickness', False):
-            fitted_names.append(('SiO2', 'sio2_thick'))
-        if fitted_config.get('fit_hbn_thickness', False):
-            if fitted_config.get('has_top_hbn'):
-                fitted_names.append(('top hBN', 'top_hbn_thick'))
-            if fitted_config.get('has_bot_hbn'):
-                fitted_names.append(('bottom hBN', 'bot_hbn_thick'))
-        for label, key in fitted_names:
-            st.caption(f"Fitted {label} thickness: {fitted_config[key]:.3f} nm")
+        for index, diagnostic in enumerate(
+            getattr(fit_result, "resonance_diagnostics", []), start=1
+        ):
+            st.caption(
+                f"Local peak {index} ({diagnostic['center_ev']:.4f} eV): "
+                f"R2={diagnostic['local_r_squared']:.4f}, "
+                f"amplitude={diagnostic['amplitude_ratio']:.2f}x"
+            )
+        fitted_layer_rows = [
+            (index, layer) for index, layer in enumerate(fitted_config['layers']) if layer['fit']
+        ]
+        for index, layer in fitted_layer_rows:
+            st.caption(
+                f"Fitted layer {index + 1} ({layer['material']}): "
+                f"{layer['thickness_nm']:.3f} nm"
+            )
         if fit_result.jacobian_condition > 1e10:
             st.warning("The Jacobian is ill-conditioned; some fitted parameters are not independently identifiable.")
         
@@ -792,10 +833,10 @@ with col1:
             params_export.append({"Parameter": f"Oscillator {i+1} wL", "Value": p_final[base+2], "Std_Error": fit_result.standard_errors[base+2]})
             if stride == 4:
                 params_export.append({"Parameter": f"Oscillator {i+1} wG", "Value": p_final[base+3], "Std_Error": fit_result.standard_errors[base+3]})
-        for offset, (label, key) in enumerate(fitted_names):
+        for offset, (index, layer) in enumerate(fitted_layer_rows):
             params_export.append({
-                "Parameter": f"{label} Thickness (nm)",
-                "Value": fitted_config[key],
+                "Parameter": f"Layer {index + 1} {layer['material']} Thickness (nm)",
+                "Value": layer['thickness_nm'],
                 "Std_Error": fit_result.standard_errors[len(p_final) + offset],
             })
         

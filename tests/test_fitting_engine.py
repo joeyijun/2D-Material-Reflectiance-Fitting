@@ -6,6 +6,7 @@ from fitting_engine import (
     composite_derivative_residual,
     fit_spectrum,
     guess_resonances,
+    resonance_balanced_sigma,
     smoothed_spectral_derivative,
 )
 
@@ -47,6 +48,18 @@ class FittingEngineTests(unittest.TestCase):
         guesses = guess_resonances(energy, peak + dip)
         self.assertEqual(len(guesses), 1, msg=str(guesses))
         self.assertAlmostEqual(guesses[0, 0], 2.106, delta=0.01)
+
+    def test_resonance_balancing_upweights_a_weak_local_feature(self):
+        energy = np.linspace(1.6, 2.0, 801)
+        strong = np.exp(-0.5 * ((energy - 1.72) / 0.008) ** 2)
+        weak = 0.04 * np.exp(-0.5 * ((energy - 1.82) / 0.012) ** 2)
+        measured = strong + weak
+        sigma = resonance_balanced_sigma(
+            energy, measured, [(1.72, 0.016), (1.82, 0.024)]
+        )
+        weak_window = np.abs(energy - 1.82) < 0.02
+        outside = (energy > 1.90) & (energy < 1.98)
+        self.assertLess(np.median(sigma[weak_window]), np.median(sigma[outside]) / 5)
 
     def test_recovers_parameters_with_drift_and_outliers(self):
         rng = np.random.default_rng(7)

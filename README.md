@@ -23,8 +23,7 @@
     *   Substrate: Si (支持温度修正), Quartz, Sapphire, TiO2 等。
     *   Dielectric: SiO2, hBN (Top/Bottom 封装层)。
     *   2D Material: 单层或少层样品。
-*   **温度相关性**: 内置 Si 折射率的温度修正模型 (10K - 300K)，适用于低温光谱拟合。
-*   **有限数值孔径**: 对物镜入瞳进行 Gauss-Legendre 角度积分并平均 s/p 偏振；`NA=0` 时退化为法向入射模型。
+*   **高级光学默认值**: 温度、有限 NA、Si 光学数据源和背景介电常数保留为代码级参数，界面使用稳定默认值。
 *   **受控材料插值**: Si 光学常数在 400--1305 nm 内使用保形 PCHIP，区间外使用端点切线线性延拓并保持被动性。
 *   **复 Voigt 介电函数（推荐）**: 使用 Faddeeva 函数分别拟合 Lorentz 均匀展宽 $w_L$ 和 Gaussian 非均匀展宽 $w_G$；经典 Lorentz 模型仍可选择。
     
@@ -38,6 +37,9 @@
     *   **Global + Robust LM**: 先进行差分进化全局初始化，再执行 Robust TRF + LM，适用于初值不确定或多峰耦合情况。
     *   **Derivative + LM**: 先用原始谱预热，再联合拟合原始谱与 Savitzky-Golay 平滑的 $dC/dE$ 或 $d^2C/dE^2$，避免噪声主导。
 *   **结构参数联合拟合**: 可联合拟合 SiO2 以及已启用的上/下 hBN 厚度。
+*   **任意层堆栈表**: 按入射侧到基底侧逐行设置 `Sample`、hBN、Graphene、SiO2、Quartz、Sapphire 或 TiO2。每层可独立设置厚度、参考区域、是否拟合及拟合上下界，并提供常见封装结构预设。
+*   **拟合控制**: 界面保留优化预算和分阶段进度；E0 搜索半宽及背景阶数使用代码默认值。
+*   **弱峰保护**: 每个初始共振区域按自身去趋势幅度平衡残差，并报告逐峰局部 $R^2$ 和振幅恢复率，避免高全谱 GOF 掩盖弱峰漏拟合。
 *   **可分离慢变背景**: 每次非线性迭代中用线性最小二乘消去三阶慢变漂移，避免将光源/探测器基线误归因于介电函数。
 *   **Auto-Guess (自动猜峰)**: 使用 Savitzky-Golay 平滑、低阶背景消除和鲁棒噪声阈值生成初值，并合并同一色散共振产生的相邻峰谷。
 *   **参数约束与锁定**: 支持设置参数范围 (Bounds) 和锁定特定参数 (Lock) 不参与拟合。
@@ -138,8 +140,7 @@ The tool offers two modes of operation:
     *   Substrate: Si (with temp correction), Quartz, Sapphire, TiO2, etc.
     *   Dielectric: SiO2, hBN (Top/Bottom encapsulation).
     *   2D Material: Monolayer or few-layer samples.
-*   **Temperature Dependence**: Built-in temperature-dependent refractive index model for Silicon (10K - 300K), ideal for low-temperature spectroscopy.
-*   **Finite Numerical Aperture**: Gauss-Legendre pupil integration with unpolarized s/p averaging; `NA=0` recovers normal incidence.
+*   **Advanced Optical Defaults**: temperature, finite NA, Si optical source, and background epsilon remain code-level parameters while the UI uses stable defaults.
 *   **Controlled Interpolation**: Si uses shape-preserving PCHIP in 400--1305 nm and passive endpoint-tangent linear extrapolation outside that range.
 *   **Complex Voigt Dielectric Function (recommended)**: Faddeeva oscillators separate Lorentzian homogeneous width $w_L$ from Gaussian inhomogeneous width $w_G$; the classical Lorentz model remains available.
   
@@ -153,6 +154,9 @@ The tool offers two modes of operation:
     *   **Global + Robust LM**: Differential Evolution initialization followed by robust TRF and LM.
     *   **Derivative + LM**: warm-starts on the original spectrum, then jointly fits the spectrum and smoothed first or second energy derivative.
 *   **Joint Structure Fit**: optionally fits SiO2 and enabled top/bottom hBN thicknesses.
+*   **Arbitrary Layer Table**: order Sample, hBN, Graphene, SiO2, Quartz, Sapphire, and TiO2 layers from the incident side to the substrate. Each row controls thickness, reference-region inclusion, fit state, and bounds.
+*   **Fit Controls**: the UI exposes the optimization budget and staged progress; E0 search width and baseline order use code defaults.
+*   **Weak-feature preservation**: resonance neighborhoods are balanced by their own detrended amplitudes and receive per-peak local $R^2$ and amplitude-recovery diagnostics.
 *   **Variable-projection baseline**: cubic slow measurement drift is separated from nonlinear dielectric parameters.
 *   **Auto-Guess**: smoothed, detrended, noise-adaptive initialization that merges the peak/dip pair of one dispersive resonance.
 *   **Constraints & Locking**: Supports parameter bounds and locking specific parameters (e.g., fixing a known peak position) during fitting.

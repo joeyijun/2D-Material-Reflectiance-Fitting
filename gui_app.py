@@ -7,6 +7,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QPushButton, QFileDialog, QDoubleSpinBox, QTableWidget, 
                              QTableWidgetItem, QHeaderView, QMessageBox, QGroupBox, QFormLayout,
                              QCheckBox, QComboBox)
+from PyQt6.QtWidgets import QSpinBox, QProgressBar, QScrollArea
+from PyQt6.QtWidgets import QGridLayout
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -17,12 +19,18 @@ from fitting_engine import (
     finalize_physical_fit,
     fit_spectrum,
     guess_resonances,
+    resonance_balanced_sigma,
+    resonance_diagnostics,
+    resonance_windows_from_parameters,
 )
 from optical_model import (
     HC_EV_NM,
+    LAYER_MATERIALS,
     calculate_contrast_dynamic as calculate_contrast_core,
+    config_with_layer_thicknesses,
     dielectric_func_lorentz as dielectric_func_lorentz_core,
     dielectric_func_voigt,
+    layer_fit_parameters,
     spectral_derivative,
 )
 from scipy.interpolate import interp1d
@@ -269,6 +277,7 @@ class FittingWorker(QThread):
     finished = pyqtSignal(object, object, object) # results, popt, pcov
     error = pyqtSignal(str)
     aborted = pyqtSignal()
+    progress = pyqtSignal(int, str)
 
     def __init__(self, x_data, y_data, mat_loader, p0, bounds, structure_config, fit_range, locked_mask):
         super().__init__()
@@ -290,6 +299,7 @@ class FittingWorker(QThread):
 
     def run(self):
         try:
+            self.progress.emit(5, "Preparing model")
             energy_all = HC_EV_NM / self.x_data
             mask = (energy_all >= self.fit_range[0]) & (energy_all <= self.fit_range[1])
             wavelengths = self.x_data[mask]
@@ -302,6 +312,7 @@ class FittingWorker(QThread):
                 'Derivative': 1,
                 '2nd Derivative': 2,
             }.get(self.fit_method, 0)
+            baseline_order = int(self.structure_config.get('baseline_order', 3))
             if derivative_order:
                 objective_energy = np.tile(energy, derivative_order + 1)
                 target = np.zeros(objective_energy.size)
@@ -310,18 +321,10 @@ class FittingWorker(QThread):
                 target = measured
 
             physical_count = self.p0.size
-            structure_parameters = []
-            if (self.structure_config.get('substrate_type') == 'Si/SiO2'
-                    and self.structure_config.get('fit_sio2_thickness', False)):
-                value = float(self.structure_config['sio2_thick'])
-                structure_parameters.append(('sio2_thick', value, max(0.0, value - 20.0), value + 20.0))
-            if self.structure_config.get('fit_hbn_thickness', False):
-                for enabled_key, thickness_key in (
-                    ('has_top_hbn', 'top_hbn_thick'), ('has_bot_hbn', 'bot_hbn_thick')
-                ):
-                    if self.structure_config.get(enabled_key, False):
-                        value = float(self.structure_config[thickness_key])
-                        structure_parameters.append((thickness_key, value, 0.0, 100.0))
+            line_shape = self.structure_config.get('line_shape', 'Lorentz')
+            resonances = resonance_windows_from_parameters(self.p0, line_shape)
+            balanced_sigma = resonance_balanced_sigma(energy, measured, resonances)
+            structure_parameters = layer_fit_parameters(self.structure_config)
             fit_initial = self.p0.copy()
             fit_lower = np.asarray(self.bounds[0], dtype=float)
             fit_upper = np.asarray(self.bounds[1], dtype=float)
@@ -339,9 +342,10 @@ class FittingWorker(QThread):
             )
 
             def physical_model(params):
-                model_config = self.structure_config.copy()
-                for offset, (key, _, _, _) in enumerate(structure_parameters):
-                    model_config[key] = params[physical_count + offset]
+                model_config = config_with_layer_thicknesses(
+                    self.structure_config,
+                    params[physical_count:physical_count + len(structure_parameters)],
+                )
                 epsilon = dielectric_model(energy, params[:physical_count])
                 return calculate_contrast_dynamic(
                     wavelengths, epsilon, self.mat_loader, model_config
@@ -351,19 +355,25 @@ class FittingWorker(QThread):
                 contrast = physical_model(params)
                 if derivative_order:
                     return composite_derivative_residual(
-                        measured, contrast, energy, maximum_order=derivative_order
+                        measured, contrast, energy,
+                        maximum_order=derivative_order,
+                        resonances=resonances,
                     )
                 return contrast
 
             if derivative_order:
+                self.progress.emit(20, "Warm-starting on original spectrum")
                 warm_result = fit_spectrum(
                     energy, measured, physical_model, fit_initial,
-                    (fit_lower, fit_upper), fit_locked, baseline_order=3,
+                    (fit_lower, fit_upper), fit_locked, baseline_order=baseline_order,
                     robust=True, global_search=self.high_precision,
-                    cancel_check=lambda: self._abort, max_nfev=6000,
+                    sigma=balanced_sigma,
+                    cancel_check=lambda: self._abort,
+                    max_nfev=int(self.structure_config.get('max_nfev', 8000)),
                 )
                 fit_initial = warm_result.params
 
+            self.progress.emit(45, "Optimizing optical and structure parameters")
             result = fit_spectrum(
                 objective_energy,
                 target,
@@ -371,34 +381,41 @@ class FittingWorker(QThread):
                 fit_initial,
                 (fit_lower, fit_upper),
                 fit_locked,
-                baseline_order=-1 if derivative_order else 3,
+                baseline_order=-1 if derivative_order else baseline_order,
                 robust=True,
                 global_search=self.high_precision and not derivative_order,
-                sigma=np.ones_like(target) if derivative_order else None,
+                sigma=np.ones_like(target) if derivative_order else balanced_sigma,
                 cancel_check=lambda: self._abort,
-                max_nfev=10000,
+                max_nfev=int(self.structure_config.get('max_nfev', 10000)),
             )
             if not result.success:
                 raise RuntimeError(result.message)
             self.fit_result = result
-            fitted_config = self.structure_config.copy()
-            self.fitted_structure = {}
-            for offset, (key, _, _, _) in enumerate(structure_parameters):
-                value = float(result.params[physical_count + offset])
-                self.fitted_structure[key] = value
-                fitted_config[key] = value
+            fitted_config = config_with_layer_thicknesses(
+                self.structure_config,
+                result.params[physical_count:physical_count + len(structure_parameters)],
+            )
+            self.fitted_layers = fitted_config['layers']
 
             physical_params = result.params[:physical_count]
             epsilon_roi = dielectric_model(energy, physical_params)
             physical_roi = calculate_contrast_dynamic(
                 wavelengths, epsilon_roi, self.mat_loader, fitted_config
             )
-            finalize_physical_fit(result, energy, measured, physical_roi, baseline_order=3)
+            self.progress.emit(90, "Calculating fit statistics")
+            finalize_physical_fit(
+                result, energy, measured, physical_roi,
+                baseline_order=baseline_order, sigma=balanced_sigma,
+            )
+            result.resonance_diagnostics = resonance_diagnostics(
+                energy, measured, result.fitted, resonances
+            )
             epsilon_full = dielectric_model(energy_all, physical_params)
             physical_full = calculate_contrast_dynamic(
                 self.x_data, epsilon_full, self.mat_loader, fitted_config
             )
             fitted_full = result.add_baseline(physical_full, energy_all)
+            self.progress.emit(100, "Fit complete")
             self.finished.emit(fitted_full, physical_params, result.r_squared)
         except FitCancelled:
             self.aborted.emit()
@@ -475,10 +492,11 @@ class MainWindow(QMainWindow):
         
         # --- Structure & Constants ---
         group_struct = QGroupBox("Structure Configuration")
+        struct_layout = QVBoxLayout()
         form_struct = QFormLayout()
         
         self.combo_sub = QComboBox()
-        self.combo_sub.addItems(["Si/SiO2", "Quartz", "Sapphire", "TiO2"])
+        self.combo_sub.addItems(["Si", "Quartz", "Sapphire", "TiO2"])
         self.combo_sub.currentIndexChanged.connect(self.on_substrate_changed)
 
         self.combo_si_data = QComboBox()
@@ -497,15 +515,6 @@ class MainWindow(QMainWindow):
                 lay.addWidget(QLabel(unit))
             return container
 
-        # SiO2
-        self.lbl_sio2 = QLabel("SiO2 Thickness:")
-        self.spin_sio2 = QDoubleSpinBox()
-        self.spin_sio2.setRange(0, 1000)
-        self.spin_sio2.setValue(285.0)
-        self.container_sio2 = create_unit_spinbox(self.spin_sio2, "nm")
-        self.chk_fit_sio2 = QCheckBox("Fit SiO2 thickness (+/-20 nm)")
-        self.chk_fit_sio2.setChecked(True)
-        
         # Temp
         self.lbl_temp = QLabel("Temperature:")
         self.spin_temp = QDoubleSpinBox()
@@ -523,51 +532,57 @@ class MainWindow(QMainWindow):
         )
         self.spin_na.valueChanged.connect(self.on_na_changed)
         
-        # Top hBN
-        self.chk_top_hbn = QCheckBox("Top hBN")
-        self.spin_top_hbn = QDoubleSpinBox()
-        self.spin_top_hbn.setRange(0, 200)
-        self.spin_top_hbn.setValue(10.0)
-        container_top = create_unit_spinbox(self.spin_top_hbn, "nm")
-        
-        # Bottom hBN
-        self.chk_bot_hbn = QCheckBox("Bottom hBN")
-        self.spin_bot_hbn = QDoubleSpinBox()
-        self.spin_bot_hbn.setRange(0, 200)
-        self.spin_bot_hbn.setValue(10.0)
-        container_bot = create_unit_spinbox(self.spin_bot_hbn, "nm")
-        self.chk_fit_hbn = QCheckBox("Fit enabled hBN thicknesses (0-100 nm)")
-        
-        # Sample Thickness
-        self.spin_2d = QDoubleSpinBox()
-        self.spin_2d.setRange(0, 100)
-        self.spin_2d.setValue(0.65)
-        self.spin_2d.setSingleStep(0.01)
-        container_2d = create_unit_spinbox(self.spin_2d, "nm")
-
         # Eps inf
         self.spin_eps_inf = QDoubleSpinBox()
         self.spin_eps_inf.setRange(1, 50)
         self.spin_eps_inf.setValue(12.0)
-        
-        form_struct.addRow("Substrate:", self.combo_sub)
-        form_struct.addRow("Si optical data:", self.combo_si_data)
-        form_struct.addRow(self.lbl_sio2, self.container_sio2)
-        form_struct.addRow("", self.chk_fit_sio2)
-        form_struct.addRow(self.lbl_temp, self.container_temp)
-        form_struct.addRow("Illumination NA:", self.spin_na)
-        form_struct.addRow(self.chk_top_hbn, container_top)
-        form_struct.addRow("Sample Thickness:", container_2d)
-        form_struct.addRow(self.chk_bot_hbn, container_bot)
-        form_struct.addRow("", self.chk_fit_hbn)
-        form_struct.addRow("Background Eps:", self.spin_eps_inf)
-        
-        group_struct.setLayout(form_struct)
+        for advanced_widget in (
+            self.combo_si_data, self.lbl_temp, self.container_temp,
+            self.spin_na, self.spin_eps_inf,
+        ):
+            advanced_widget.hide()
+
+        form_struct.addRow("Semi-infinite substrate:", self.combo_sub)
+        struct_layout.addLayout(form_struct)
+
+        preset_row = QHBoxLayout()
+        self.combo_structure_preset = QComboBox()
+        self.combo_structure_preset.addItems([
+            "Sample / SiO2 / Si",
+            "hBN / Sample / hBN / SiO2 / Si",
+            "hBN / Graphene / Sample / Graphene / hBN / SiO2 / Si",
+        ])
+        btn_preset = QPushButton("Apply Preset")
+        btn_preset.clicked.connect(self.apply_structure_preset)
+        preset_row.addWidget(QLabel("Preset:"))
+        preset_row.addWidget(self.combo_structure_preset)
+        preset_row.addWidget(btn_preset)
+        struct_layout.addLayout(preset_row)
+
+        self.table_layers = CopyableTableWidget(0, 6)
+        self.table_layers.setHorizontalHeaderLabels([
+            "Material", "Thickness (nm)", "In reference", "Fit", "Min (nm)", "Max (nm)"
+        ])
+        self.table_layers.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_layers.setMinimumHeight(150)
+        struct_layout.addWidget(self.table_layers)
+        layer_buttons = QHBoxLayout()
+        for label, callback in (
+            ("Add Layer", self.add_structure_layer), ("Remove", self.remove_structure_layer),
+            ("Move Up", lambda: self.move_structure_layer(-1)),
+            ("Move Down", lambda: self.move_structure_layer(1)),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _checked=False, fn=callback: fn())
+            layer_buttons.addWidget(button)
+        struct_layout.addLayout(layer_buttons)
+        group_struct.setLayout(struct_layout)
         layout.addWidget(group_struct)
+        self.apply_structure_preset()
 
         # --- Fitting Optimization ---
         group_opt = QGroupBox("Fitting Optimization")
-        layout_opt = QHBoxLayout()
+        layout_opt = QGridLayout()
         
         self.spin_range_min = QDoubleSpinBox()
         self.spin_range_min.setRange(0, 10)
@@ -577,11 +592,10 @@ class MainWindow(QMainWindow):
         self.spin_range_max.setRange(0, 10)
         self.spin_range_max.setValue(3.0)
         
-        layout_opt.addWidget(QLabel("ROI (eV):"))
-        layout_opt.addWidget(QLabel("Min"))
-        layout_opt.addWidget(self.spin_range_min)
-        layout_opt.addWidget(QLabel("Max"))
-        layout_opt.addWidget(self.spin_range_max)
+        layout_opt.addWidget(QLabel("ROI min (eV):"), 0, 0)
+        layout_opt.addWidget(self.spin_range_min, 0, 1)
+        layout_opt.addWidget(QLabel("ROI max (eV):"), 0, 2)
+        layout_opt.addWidget(self.spin_range_max, 0, 3)
         
         self.combo_fit_method = QComboBox()
         self.combo_fit_method.addItems([
@@ -590,13 +604,26 @@ class MainWindow(QMainWindow):
             "1st Derivative + LM",
             "2nd Derivative + LM",
         ])
-        layout_opt.addWidget(QLabel("Method:"))
-        layout_opt.addWidget(self.combo_fit_method)
+        layout_opt.addWidget(QLabel("Method:"), 1, 0)
+        layout_opt.addWidget(self.combo_fit_method, 1, 1, 1, 3)
 
         self.combo_line_shape = QComboBox()
         self.combo_line_shape.addItems(["Voigt / Faddeeva (Recommended)", "Lorentz"])
-        layout_opt.addWidget(QLabel("Line shape:"))
-        layout_opt.addWidget(self.combo_line_shape)
+        self.combo_line_shape.currentIndexChanged.connect(self.on_line_shape_changed)
+        layout_opt.addWidget(QLabel("Line shape:"), 2, 0)
+        layout_opt.addWidget(self.combo_line_shape, 2, 1, 1, 3)
+
+        self.spin_e0_margin = QDoubleSpinBox()
+        self.spin_e0_margin.setRange(0.001, 0.2)
+        self.spin_e0_margin.setDecimals(3)
+        self.spin_e0_margin.setValue(0.02)
+        self.spin_e0_margin.setToolTip("Allowed movement around each initial E0")
+
+        self.spin_baseline_order = QSpinBox()
+        self.spin_baseline_order.setRange(0, 5)
+        self.spin_baseline_order.setValue(3)
+        self.spin_e0_margin.hide()
+        self.spin_baseline_order.hide()
         
         group_opt.setLayout(layout_opt)
         layout.addWidget(group_opt)
@@ -656,9 +683,18 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(hbox_actions_top)
         layout.addWidget(self.btn_fit)
+        self.fit_progress = QProgressBar()
+        self.fit_progress.setRange(0, 100)
+        self.fit_progress.setVisible(False)
+        layout.addWidget(self.fit_progress)
         
         layout.addStretch()
-        self.main_layout.addWidget(panel, 1)
+        panel.setMinimumWidth(560)
+        scroll = QScrollArea()
+        scroll.setMinimumWidth(600)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(panel)
+        self.main_layout.addWidget(scroll, 1)
 
     def setup_plot_area(self):
         self.canvas = MplCanvas(self, width=5, height=4, dpi=100)
@@ -676,17 +712,101 @@ class MainWindow(QMainWindow):
         self.last_y_exp = None
         self.last_y_fit = None
 
+    def _table_checkbox(self, checked=False, enabled=True):
+        cell = QWidget()
+        checkbox = QCheckBox()
+        checkbox.setChecked(bool(checked))
+        checkbox.setEnabled(enabled)
+        layout = QHBoxLayout(cell)
+        layout.addWidget(checkbox)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(0, 0, 0, 0)
+        return cell
+
+    def add_structure_layer(self, material="hBN", thickness=10.0, in_reference=True,
+                            fit=False, minimum=0.0, maximum=100.0, row=None):
+        row = self.table_layers.rowCount() if row is None else row
+        self.table_layers.insertRow(row)
+        material_box = QComboBox()
+        material_box.addItems(LAYER_MATERIALS)
+        material_box.setCurrentText(material)
+        self.table_layers.setCellWidget(row, 0, material_box)
+        for column, value in ((1, thickness), (4, minimum), (5, maximum)):
+            self.table_layers.setItem(row, column, QTableWidgetItem(str(value)))
+        reference_cell = self._table_checkbox(
+            in_reference and material != "Sample", material != "Sample"
+        )
+        self.table_layers.setCellWidget(row, 2, reference_cell)
+        reference_checkbox = reference_cell.findChild(QCheckBox)
+        def update_reference_state(text, checkbox=reference_checkbox):
+            is_sample = text == "Sample"
+            if is_sample:
+                checkbox.setChecked(False)
+            checkbox.setEnabled(not is_sample)
+        material_box.currentTextChanged.connect(update_reference_state)
+        self.table_layers.setCellWidget(row, 3, self._table_checkbox(fit))
+
+    def _layer_row_data(self, row):
+        material = self.table_layers.cellWidget(row, 0).currentText()
+        values = [float(self.table_layers.item(row, column).text()) for column in (1, 4, 5)]
+        reference = self.table_layers.cellWidget(row, 2).findChild(QCheckBox).isChecked()
+        fit = self.table_layers.cellWidget(row, 3).findChild(QCheckBox).isChecked()
+        return material, values[0], reference, fit, values[1], values[2]
+
+    def get_structure_layers(self):
+        return [
+            {
+                "material": material, "thickness_nm": thickness,
+                "in_reference": reference, "fit": fit,
+                "min_nm": minimum, "max_nm": maximum,
+            }
+            for material, thickness, reference, fit, minimum, maximum in
+            (self._layer_row_data(row) for row in range(self.table_layers.rowCount()))
+        ]
+
+    def apply_structure_preset(self):
+        presets = {
+            0: [("Sample", 0.65, False, False, 0.1, 2.0),
+                ("SiO2", 285.0, True, True, 265.0, 305.0)],
+            1: [("hBN", 10.0, False, True, 0.0, 100.0),
+                ("Sample", 0.65, False, False, 0.1, 2.0),
+                ("hBN", 10.0, False, True, 0.0, 100.0),
+                ("SiO2", 285.0, True, True, 265.0, 305.0)],
+            2: [("hBN", 10.0, False, True, 0.0, 100.0),
+                ("Graphene", 0.335, False, False, 0.1, 2.0),
+                ("Sample", 0.65, False, False, 0.1, 2.0),
+                ("Graphene", 0.335, False, False, 0.1, 2.0),
+                ("hBN", 10.0, False, True, 0.0, 100.0),
+                ("SiO2", 285.0, True, True, 265.0, 305.0)],
+        }
+        self.combo_sub.setCurrentText("Si")
+        self.table_layers.setRowCount(0)
+        for row in presets[self.combo_structure_preset.currentIndex()]:
+            self.add_structure_layer(*row)
+
+    def remove_structure_layer(self):
+        row = self.table_layers.currentRow()
+        if row >= 0:
+            self.table_layers.removeRow(row)
+
+    def move_structure_layer(self, direction):
+        row = self.table_layers.currentRow()
+        target = row + direction
+        if row < 0 or target < 0 or target >= self.table_layers.rowCount():
+            return
+        data = self._layer_row_data(row)
+        self.table_layers.removeRow(row)
+        self.add_structure_layer(*data, row=target)
+        self.table_layers.setCurrentCell(target, 1)
+
     def on_substrate_changed(self, index):
-        sub_type = self.combo_sub.currentText()
-        is_si = (sub_type == "Si/SiO2")
-        
-        self.lbl_sio2.setVisible(is_si)
-        self.container_sio2.setVisible(is_si)
-        self.combo_si_data.setVisible(is_si)
-        self.chk_fit_sio2.setVisible(is_si)
-        
-        self.lbl_temp.setVisible(is_si)
-        self.container_temp.setVisible(is_si)
+        # Advanced substrate settings remain code-level defaults.
+        pass
+
+    def on_line_shape_changed(self, index):
+        show_gaussian = index == 0
+        self.table_exc.setColumnHidden(6, not show_gaussian)
+        self.table_exc.setColumnHidden(7, not show_gaussian)
 
     def on_si_data_changed(self, filename):
         if not filename:
@@ -817,13 +937,17 @@ class MainWindow(QMainWindow):
 
     def _infer_sio2_thickness_from_filename(self, path):
         filename = os.path.basename(path)
+        if len(re.findall(r"hBN", filename, re.IGNORECASE)) >= 2:
+            self.combo_structure_preset.setCurrentIndex(1)
+            self.apply_structure_preset()
         match = re.search(r"(\d+(?:\.\d+)?)\s*nm\s*SiO2", filename, re.IGNORECASE)
         if match:
-            self.spin_sio2.setValue(float(match.group(1)))
-        if len(re.findall(r"hBN", filename, re.IGNORECASE)) >= 2:
-            self.chk_top_hbn.setChecked(True)
-            self.chk_bot_hbn.setChecked(True)
-            self.chk_fit_hbn.setChecked(True)
+            oxide = float(match.group(1))
+            for row in range(self.table_layers.rowCount()):
+                if self.table_layers.cellWidget(row, 0).currentText() == "SiO2":
+                    self.table_layers.item(row, 1).setText(str(oxide))
+                    self.table_layers.item(row, 4).setText(str(max(0.0, oxide - 20.0)))
+                    self.table_layers.item(row, 5).setText(str(oxide + 20.0))
             
     def get_processed_data(self):
         """Helper to load and process data returning (x_ev, y_contrast)"""
@@ -990,6 +1114,8 @@ class MainWindow(QMainWindow):
         self.btn_fit.setText("Stop Fitting")
         self.btn_fit.setStyleSheet("background-color: #ffaaaa; color: black;") # Red tint
         self.btn_fit.setEnabled(True) # Keep enabled so user can click to stop
+        self.fit_progress.setValue(0)
+        self.fit_progress.setVisible(True)
     
         try:
             # 3. Prepare Config
@@ -1009,20 +1135,15 @@ class MainWindow(QMainWindow):
             
             struct_config = {
                 'substrate_type': self.combo_sub.currentText(),
-                'sio2_thick': self.spin_sio2.value(),
-                'fit_sio2_thickness': self.chk_fit_sio2.isChecked(),
                 'temp': self.spin_temp.value(),
                 'numerical_aperture': self.spin_na.value(),
-                'sample_thick': self.spin_2d.value(),
-                'has_top_hbn': self.chk_top_hbn.isChecked(),
-                'top_hbn_thick': self.spin_top_hbn.value(),
-                'has_bot_hbn': self.chk_bot_hbn.isChecked(),
-                'bot_hbn_thick': self.spin_bot_hbn.value(),
-                'fit_hbn_thickness': self.chk_fit_hbn.isChecked(),
+                'layers': self.get_structure_layers(),
                 'contrast_definition': 'relative',
                 'line_shape': 'Voigt' if self.combo_line_shape.currentIndex() == 0 else 'Lorentz',
                 'fit_method': fit_method,
                 'high_precision': high_prec
+                ,'baseline_order': self.spin_baseline_order.value()
+                ,'max_nfev': 12000 if high_prec else 8000
             }
 
             # 4. Prepare Params & Locks
@@ -1100,24 +1221,37 @@ class MainWindow(QMainWindow):
                     user_E0_values.append(2.0)  # Fallback
             
             # Tight E0 margin (+/-0.15 eV) to prioritize user settings
-            E0_margin = 0.02
+            E0_margin = self.spin_e0_margin.value()
             
             for i in range(num_osc):
+                base = 1 + i * stride
+                if stride == 4:
+                    w_l, w_g = p0[base + 2], p0[base + 3]
+                    approximate_fwhm = (
+                        0.5346 * w_l + np.sqrt(0.2166 * w_l**2 + w_g**2)
+                    )
+                    width_upper = min(
+                        0.5, max(0.015, 4.0 * approximate_fwhm, 1.25 * w_l, 1.25 * w_g)
+                    )
+                else:
+                    approximate_fwhm = p0[base + 2]
+                    width_upper = min(0.5, max(0.015, 4.0 * approximate_fwhm))
                 # f: 0 to 20
                 bounds_min.append(0.0)
                 bounds_max.append(20.0)
                 
                 # E0: Tight bounds around user-specified value
                 user_E0 = user_E0_values[i] if i < len(user_E0_values) else 2.0
-                bounds_min.append(max(0.1, user_E0 - E0_margin))
-                bounds_max.append(user_E0 + E0_margin)
+                local_e0_margin = min(E0_margin, max(0.004, 0.35 * approximate_fwhm))
+                bounds_min.append(max(0.1, user_E0 - local_e0_margin))
+                bounds_max.append(user_E0 + local_e0_margin)
                 
                 # Gamma: 0.0001 to 0.5 eV (Prevent singular or too broad)
                 bounds_min.append(0.0001)
-                bounds_max.append(0.5)
+                bounds_max.append(width_upper)
                 if stride == 4:
                     bounds_min.append(0.0001)
-                    bounds_max.append(0.5)
+                    bounds_max.append(width_upper)
             
             # 5. Fit Range
             fit_range = (self.spin_range_min.value(), self.spin_range_max.value())
@@ -1128,6 +1262,7 @@ class MainWindow(QMainWindow):
             self.worker.finished.connect(lambda y, p, r2: self.on_fit_finished(x_exp_nm, y_contrast_exp, y, p, r2, locked_mask))
             self.worker.error.connect(self.on_fit_error)
             self.worker.aborted.connect(self.on_fit_aborted)
+            self.worker.progress.connect(self.on_fit_progress)
             self.worker.start()
 
         except Exception as e:
@@ -1138,11 +1273,18 @@ class MainWindow(QMainWindow):
         self.btn_fit.setText("Start Fitting")
         self.btn_fit.setStyleSheet("")
         self.status_label.setText("Fitting stopped by user.")
+        self.fit_progress.setVisible(False)
+
+    def on_fit_progress(self, value, message):
+        self.fit_progress.setValue(value)
+        self.fit_progress.setFormat(f"{message} (%p%)")
+        self.status_label.setText(message)
 
     def on_fit_finished(self, x_data, y_data, y_fit, popt, r_squared, locked_mask):
         self.btn_fit.setEnabled(True)
         self.btn_fit.setText("Start Fitting")
         self.btn_fit.setStyleSheet("") # Reset Color
+        self.fit_progress.setVisible(False)
         
         # Convert Wavelength (nm) to Energy (eV)
         x_ev = HC_EV_NM / x_data
@@ -1173,13 +1315,10 @@ class MainWindow(QMainWindow):
         self.last_y_exp = y_data
         self.last_y_fit = y_fit
         self.last_fit_result = getattr(self.worker, 'fit_result', None)
-        fitted_structure = getattr(self.worker, 'fitted_structure', {})
-        if 'sio2_thick' in fitted_structure:
-            self.spin_sio2.setValue(fitted_structure['sio2_thick'])
-        if 'top_hbn_thick' in fitted_structure:
-            self.spin_top_hbn.setValue(fitted_structure['top_hbn_thick'])
-        if 'bot_hbn_thick' in fitted_structure:
-            self.spin_bot_hbn.setValue(fitted_structure['bot_hbn_thick'])
+        fitted_layers = getattr(self.worker, 'fitted_layers', [])
+        for row, layer in enumerate(fitted_layers):
+            if row < self.table_layers.rowCount():
+                self.table_layers.item(row, 1).setText(f"{layer['thickness_nm']:.6g}")
         
         # Update UI with results
         # popt[0] is eps_inf
@@ -1212,10 +1351,22 @@ class MainWindow(QMainWindow):
             )
             if result.jacobian_condition > 1e10:
                 msg += "\n\nWarning: parameters are strongly correlated; reported values may not be identifiable."
-            for offset, (key, value) in enumerate(fitted_structure.items()):
+            fitted_rows = [layer for layer in fitted_layers if layer['fit']]
+            for offset, layer in enumerate(fitted_rows):
                 error_index = len(popt) + offset
-                msg += f"\n{key} = {value:.4f} +/- {result.standard_errors[error_index]:.2g} nm"
+                msg += (
+                    f"\n{layer['material']} thickness = {layer['thickness_nm']:.4f} +/- "
+                    f"{result.standard_errors[error_index]:.2g} nm"
+                )
             msg += f"\nEps_inf = {popt[0]:.5g} +/- {result.standard_errors[0]:.2g}"
+            for index, diagnostic in enumerate(
+                getattr(result, 'resonance_diagnostics', []), start=1
+            ):
+                msg += (
+                    f"\nLocal peak {index} ({diagnostic['center_ev']:.4f} eV): "
+                    f"R2 = {diagnostic['local_r_squared']:.4f}, amplitude = "
+                    f"{diagnostic['amplitude_ratio']:.2f}x"
+                )
             for i in range((len(popt) - 1) // stride):
                 base = 1 + stride * i
                 msg += (
@@ -1235,6 +1386,8 @@ class MainWindow(QMainWindow):
         self.btn_fit.setEnabled(True)
         self.btn_fit.setText("Start Fitting")
         self.btn_fit.setStyleSheet("") # Reset Color
+        self.fit_progress.setVisible(False)
+        self.status_label.setText("Fit failed")
         QMessageBox.critical(self, "Fitting Error", err_msg)
 
 if __name__ == "__main__":

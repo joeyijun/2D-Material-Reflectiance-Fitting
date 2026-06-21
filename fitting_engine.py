@@ -77,13 +77,21 @@ def smoothed_spectral_derivative(values, energy_ev, order=1, smoothing_ev=None):
     return derivative
 
 
-def finalize_physical_fit(result, energy_ev, measured, physical_model, baseline_order=3):
+def finalize_physical_fit(
+    result, energy_ev, measured, physical_model, baseline_order=3, sigma=None
+):
     """Re-evaluate a fit in the original spectrum domain after derivative fitting."""
     energy_ev = np.asarray(energy_ev, dtype=float)
     measured = np.asarray(measured, dtype=float)
     physical_model = np.asarray(physical_model, dtype=float)
     design, center, scale = _baseline_design(energy_ev, baseline_order)
-    coefficients, baseline = _profile_baseline(measured - physical_model, design)
+    weights = None
+    if sigma is not None:
+        sigma = np.broadcast_to(np.asarray(sigma, dtype=float), measured.shape)
+        weights = 1.0 / sigma**2
+    coefficients, baseline = _profile_baseline(
+        measured - physical_model, design, weights
+    )
     fitted = physical_model + baseline
     residual = fitted - measured
     rss = float(np.sum(residual**2))
@@ -101,8 +109,85 @@ def finalize_physical_fit(result, energy_ev, measured, physical_model, baseline_
     return result
 
 
+def resonance_balanced_sigma(energy_ev, measured, resonances):
+    """Per-point scales that give each requested resonance local influence.
+
+    ``resonances`` contains ``(center_eV, approximate_fwhm_eV)`` pairs. The
+    full-spectrum scale is replaced near each resonance by its locally
+    detrended amplitude, with a robust noise floor to avoid fitting noise.
+    """
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    measured = np.asarray(measured, dtype=float)
+    if energy_ev.shape != measured.shape or energy_ev.ndim != 1:
+        raise ValueError("energy and measured arrays must have equal one-dimensional shapes")
+    global_scale = max(float(np.std(measured)), np.finfo(float).eps)
+    noise_floor = 5.0 * _noise_scale(measured)
+    sigma = np.full(measured.shape, global_scale)
+    for center, fwhm in resonances:
+        radius = float(np.clip(2.0 * max(float(fwhm), 0.005), 0.02, 0.08))
+        mask = np.abs(energy_ev - float(center)) <= radius
+        if np.count_nonzero(mask) < 7:
+            continue
+        local_energy = energy_ev[mask]
+        normalized = (local_energy - np.mean(local_energy)) / max(np.ptp(local_energy), 1e-12)
+        trend = np.polyval(np.polyfit(normalized, measured[mask], 1), normalized)
+        local_scale = max(float(np.std(measured[mask] - trend)), noise_floor)
+        sigma[mask] = np.minimum(sigma[mask], local_scale)
+    return sigma
+
+
+def resonance_windows_from_parameters(params, line_shape):
+    """Extract (center, approximate FWHM) pairs from dielectric parameters."""
+    params = np.asarray(params, dtype=float)
+    if str(line_shape).lower() == "voigt":
+        rows = params[1:].reshape(-1, 4)
+        widths = 0.5346 * rows[:, 2] + np.sqrt(
+            0.2166 * rows[:, 2] ** 2 + rows[:, 3] ** 2
+        )
+    else:
+        rows = params[1:].reshape(-1, 3)
+        widths = rows[:, 2]
+    return [(float(row[1]), float(width)) for row, width in zip(rows, widths)]
+
+
+def resonance_diagnostics(energy_ev, measured, fitted, resonances):
+    """Return detrended local fit metrics for every requested resonance."""
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    measured = np.asarray(measured, dtype=float)
+    fitted = np.asarray(fitted, dtype=float)
+    diagnostics = []
+    for center, fwhm in resonances:
+        radius = float(np.clip(2.0 * max(float(fwhm), 0.005), 0.02, 0.08))
+        mask = np.abs(energy_ev - float(center)) <= radius
+        if np.count_nonzero(mask) < 7:
+            continue
+        x = energy_ev[mask]
+        x = (x - np.mean(x)) / max(np.ptp(x), 1e-12)
+        measured_local = measured[mask]
+        fitted_local = fitted[mask]
+        measured_feature = measured_local - np.polyval(
+            np.polyfit(x, measured_local, 1), x
+        )
+        fitted_feature = fitted_local - np.polyval(
+            np.polyfit(x, fitted_local, 1), x
+        )
+        rss = float(np.sum((fitted_feature - measured_feature) ** 2))
+        total = float(np.sum(measured_feature**2))
+        measured_amplitude = float(np.ptp(measured_feature))
+        diagnostics.append({
+            "center_ev": float(center),
+            "local_r_squared": 1.0 - rss / total if total > 0 else np.nan,
+            "amplitude_ratio": (
+                float(np.ptp(fitted_feature)) / measured_amplitude
+                if measured_amplitude > 0 else np.nan
+            ),
+            "points": int(np.count_nonzero(mask)),
+        })
+    return diagnostics
+
+
 def composite_derivative_residual(
-    measured, predicted, energy_ev, maximum_order, baseline_order=3
+    measured, predicted, energy_ev, maximum_order, baseline_order=3, resonances=None
 ):
     """Joint spectrum/derivative residual used for stable derivative fitting."""
     measured = np.asarray(measured, dtype=float)
@@ -115,6 +200,10 @@ def composite_derivative_residual(
     derivative_weights = (1.0, 1.0, 0.5)
     measured_component = measured
     fitted_component = fitted
+    feature_weight = np.ones_like(measured)
+    if resonances:
+        local_sigma = resonance_balanced_sigma(energy_ev, measured, resonances)
+        feature_weight = np.median(local_sigma) / local_sigma
     for order in range(maximum_order + 1):
         if order:
             measured_component = smoothed_spectral_derivative(
@@ -125,7 +214,8 @@ def composite_derivative_residual(
             )
         scale = max(float(np.std(measured_component)), np.finfo(float).eps)
         residual_blocks.append(
-            derivative_weights[order] * (fitted_component - measured_component) / scale
+            derivative_weights[order] * feature_weight
+            * (fitted_component - measured_component) / scale
         )
     return np.concatenate(residual_blocks)
 
@@ -323,7 +413,12 @@ def fit_spectrum(
         prediction = np.asarray(model(full_params(free_params)), dtype=float)
         if prediction.shape != measured.shape or np.any(~np.isfinite(prediction)):
             raise ValueError("model returned non-finite values or an invalid shape")
-        coefficients, baseline = _profile_baseline(measured - prediction, design, weights)
+        profile_weights = 1.0 / noise**2
+        if weights is not None:
+            profile_weights = profile_weights * weights
+        coefficients, baseline = _profile_baseline(
+            measured - prediction, design, profile_weights
+        )
         return prediction + baseline - measured, coefficients, prediction + baseline
 
     free_initial = initial_params[free]

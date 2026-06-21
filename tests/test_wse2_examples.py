@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from fitting_engine import guess_resonances
+from wse2_benchmark import run_case
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,19 @@ class WSe2ExampleTests(unittest.TestCase):
             [1.737, 1.900],
             "1L-WSe2-quartz-substrate.csv",
         )
+
+    def test_hbn_voigt_fit_keeps_the_181_ev_resonance(self):
+        result = run_case("hbn", "voigt", derivative_order=0)
+        second = result.params[5:9]
+        self.assertGreater(second[0], 0.005)
+        self.assertAlmostEqual(second[1], 1.814, delta=0.008)
+        self.assertLess(second[2], 0.03)
+        self.assertLess(second[3], 0.03)
+        self.assertGreater(result.r_squared, 0.98)
+        second_local = result.resonance_diagnostics[1]
+        self.assertGreater(second_local["local_r_squared"], 0.9)
+        self.assertGreater(second_local["amplitude_ratio"], 0.7)
+        self.assertLess(second_local["amplitude_ratio"], 1.3)
 
 
 if __name__ == "__main__":

@@ -191,6 +191,18 @@ class MaterialLoader:
         
         return np.sqrt(n_squared) + 0j
 
+    def get_graphene_n(self, lam_nm):
+        """Effective visible/NIR index of monolayer graphene.
+
+        Uses the universal interband sheet conductivity, represented as a
+        0.335 nm film: epsilon = 1 + i*alpha*lambda/(2*d).
+        """
+        lam_nm = np.asarray(lam_nm, dtype=float)
+        fine_structure = 1.0 / 137.035999084
+        monolayer_nm = 0.335
+        epsilon = 1.0 + 1j * fine_structure * lam_nm / (2.0 * monolayer_nm)
+        return np.sqrt(epsilon)
+
     def get_quartz_n(self, lam_nm):
         """
         Quartz (Fused Silica) 折射率

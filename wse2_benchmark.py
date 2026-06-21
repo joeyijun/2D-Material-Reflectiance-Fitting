@@ -6,7 +6,14 @@ import sys
 import numpy as np
 from scipy.interpolate import interp1d
 
-from fitting_engine import composite_derivative_residual, finalize_physical_fit, fit_spectrum
+from fitting_engine import (
+    composite_derivative_residual,
+    finalize_physical_fit,
+    fit_spectrum,
+    resonance_balanced_sigma,
+    resonance_diagnostics,
+    resonance_windows_from_parameters,
+)
 from materials import MaterialLoader
 from optical_model import (
     HC_EV_NM,
@@ -92,21 +99,27 @@ def run_case(case_name, line_shape, derivative_order=0):
         strength_initial = 0.1
         strength_upper = 50.0
         for center in case["centers"]:
-            center_margin = 0.02 if case_name == "hbn" else 0.05
+            center_margin = 0.00875
             initial.extend([strength_initial, center, 0.025])
             lower.extend([0.0, center - center_margin, 0.001])
-            upper.extend([strength_upper, center + center_margin, 0.20])
+            upper.extend([strength_upper, center + center_margin, 0.10])
         dielectric = dielectric_func_lorentz
     else:
         strength_initial = 0.01
         strength_upper = 10.0
         for center in case["centers"]:
-            center_margin = 0.02 if case_name == "hbn" else 0.05
+            approximate_fwhm = 0.5346 * 0.015 + np.sqrt(0.2166 * 0.015**2 + 0.020**2)
+            center_margin = max(0.004, 0.35 * approximate_fwhm)
             initial.extend([strength_initial, center, 0.015, 0.020])
             lower.extend([0.0, center - center_margin, 0.001, 0.001])
-            upper.extend([strength_upper, center + center_margin, 0.20, 0.20])
+            upper.extend([
+                strength_upper, center + center_margin,
+                4.0 * approximate_fwhm, 4.0 * approximate_fwhm,
+            ])
         dielectric = dielectric_func_voigt
     physical_count = len(initial)
+    resonances = resonance_windows_from_parameters(initial, line_shape)
+    balanced_sigma = resonance_balanced_sigma(energy, measured, resonances)
     fit_oxide = config["substrate_type"] == "Si/SiO2"
     if fit_oxide:
         initial.append(config["sio2_thick"])
@@ -132,7 +145,9 @@ def run_case(case_name, line_shape, derivative_order=0):
         physical = physical_model(params)
         if derivative_order:
             return composite_derivative_residual(
-                measured, physical, energy, maximum_order=derivative_order
+                measured, physical, energy,
+                maximum_order=derivative_order,
+                resonances=resonances,
             )
         return physical
 
@@ -147,6 +162,7 @@ def run_case(case_name, line_shape, derivative_order=0):
             (lower, upper),
             baseline_order=3,
             robust=True,
+            sigma=balanced_sigma,
             max_nfev=1500,
         )
         initial = warm_start.params
@@ -161,12 +177,17 @@ def run_case(case_name, line_shape, derivative_order=0):
         (lower, upper),
         baseline_order=-1 if derivative_order else 3,
         robust=True,
-        sigma=np.ones_like(target) if derivative_order else None,
+        sigma=np.ones_like(target) if derivative_order else balanced_sigma,
         max_nfev=1500,
     )
-    return finalize_physical_fit(
-        result, energy, measured, physical_model(result.params), baseline_order=3
+    result = finalize_physical_fit(
+        result, energy, measured, physical_model(result.params),
+        baseline_order=3, sigma=balanced_sigma,
     )
+    result.resonance_diagnostics = resonance_diagnostics(
+        energy, measured, result.fitted, resonances
+    )
+    return result
 
 
 def main():
