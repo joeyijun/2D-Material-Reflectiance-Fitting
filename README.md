@@ -177,7 +177,7 @@ The WS2 example automatically initializes oscillators near `2.10`, `2.50`, and `
 
 ### Option 1: Web Version (Recommended)
 **No Python environment required.**
-1.  **Online**: Visit [https://reflectiance.streamlit.app/](https://reflectiance.streamlit.app/).
+1.  **Online**: Visit [https://reflectance.streamlit.app/](https://reflectance.streamlit.app/).
 2.  **Local Run**: Simply open the `index.html` file in your browser (Chrome/Edge).
 
 ### Option 2: Desktop Version (PyQt6)
