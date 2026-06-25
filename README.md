@@ -12,9 +12,9 @@
 
 下图展示了实验点、拟合曲线和 residual，可以直观看到模型对强激子峰、色散线形以及慢变背景的拟合效果。
 
-| MoSe2 example | WS2 example |
+| WSe2 example | WS2 example |
 | --- | --- |
-| ![MoSe2 optical contrast fit](example/MoSe2.png) | ![WS2 optical contrast fit](example/WS2.png) |
+| ![WSe2 optical contrast fit](example/WSe2.png) | ![WS2 optical contrast fit](example/WS2.png) |
 
 ---
 
