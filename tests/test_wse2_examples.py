@@ -63,6 +63,15 @@ class WSe2ExampleTests(unittest.TestCase):
         self.assertGreater(second_local["amplitude_ratio"], 0.7)
         self.assertLess(second_local["amplitude_ratio"], 1.3)
 
+    def test_derivative_voigt_fits_keep_wse2_resonances(self):
+        for case_name, expected in (("hbn", [1.713, 1.814]), ("quartz", [1.737, 1.900])):
+            for derivative_order in (1, 2):
+                with self.subTest(case=case_name, derivative_order=derivative_order):
+                    result = run_case(case_name, "voigt", derivative_order=derivative_order)
+                    centers = result.params[2:9:4]
+                    np.testing.assert_allclose(centers, expected, atol=0.012)
+                    self.assertGreater(result.r_squared, 0.985)
+
 
 if __name__ == "__main__":
     unittest.main()

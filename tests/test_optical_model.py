@@ -190,6 +190,12 @@ class OpticalModelTests(unittest.TestCase):
         epsilon = dielectric_func_lorentz(np.array([1.9, 2.0, 2.1]), [4.0, 1.0, 2.0, 0.05])
         self.assertTrue(np.all(np.imag(epsilon) > 0.0))
 
+    def test_lorentz_rejects_nonphysical_oscillator_parameters(self):
+        with self.assertRaises(ValueError):
+            dielectric_func_lorentz(np.array([2.0]), [4.0, -1.0, 2.0, 0.05])
+        with self.assertRaises(ValueError):
+            dielectric_func_lorentz(np.array([2.0]), [4.0, 1.0, 2.0, 0.0])
+
     def test_voigt_model_is_passive_and_peaks_at_resonance(self):
         energy = np.linspace(1.6, 2.0, 801)
         epsilon = dielectric_func_voigt(energy, [4.0, 0.02, 1.8, 0.015, 0.025])
@@ -200,6 +206,12 @@ class OpticalModelTests(unittest.TestCase):
     def test_voigt_rejects_nonpositive_width(self):
         with self.assertRaises(ValueError):
             dielectric_func_voigt(np.array([1.8]), [4.0, 0.02, 1.8, 0.01, 0.0])
+
+    def test_voigt_rejects_nonphysical_oscillator_parameters(self):
+        with self.assertRaises(ValueError):
+            dielectric_func_voigt(np.array([1.8]), [4.0, -0.02, 1.8, 0.01, 0.02])
+        with self.assertRaises(ValueError):
+            dielectric_func_voigt(np.array([1.8]), [4.0, 0.02, 0.0, 0.01, 0.02])
 
     def test_derivative_is_with_respect_to_energy(self):
         wavelengths = np.linspace(800.0, 400.0, 201)

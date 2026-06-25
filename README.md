@@ -77,36 +77,168 @@
 
 ## 使用指南 (Usage Guide)
 
-### 1. 数据准备
-你需要两组实验数据：
-*   **Substrate Spectrum (Ref)**: 空白衬底位置的反射谱（Intensity vs Wavelength/Energy）。
-*   **Sample Spectrum**: 长有二维材料位置的反射谱。
+本工具统一使用相对反射对比度：
 
-### 2. 载入与设置
-1.  **Upload Files**: 分别上传衬底和样品光谱文件。程序会自动计算实验对比度：
+$$
+C = \frac{R_s - R_0}{R_0}
+$$
 
-   $$
-    C_{exp} = C_{model} = \frac{R_{sample} - R_{sub}}{R_{sub}}
-    $$
-    
-    *(注: 本工具采用相对于衬底反射率的差分定义。)*
-3.  **Structure Config**: 设置实验样品的物理结构（如 SiO2 厚度 285nm，是否覆盖 hBN 等）。
-4.  **Material Data**: 默认使用内置的 Si (n,k) 数据。如有特殊需求，可上传自定义的 Si 折射率文件。
+其中 `R0` 是衬底/参考区域反射强度，`Rs` 是样品区域反射强度。输入文件建议为两列数值：第一列为波长 nm 或能量 eV，第二列为反射强度或已经处理好的对比度。
 
-### 3. 设置激子 (Excitons)
-*   **Auto-Guess**: 点击 "Auto Guess" 按钮，程序会自动在 ROI 范围内寻找峰位。
-*   **Manual Add**: 也可以手动点击 "Add Exciton" 添加振子，并调节初始值。
-*   **Lock**: 如果你确定某个参数（例如已知 A 激子峰位），可以勾选 "🔒" 将其锁定。
+### 网页版：一步一步操作
 
-### 4. 拟合 (Fitting)
-1.  **ROI Range**: 设置感兴趣的能量范围 (ROI Min/Max)，例如 1.5 eV - 3.0 eV。
-2.  **Method**: 优先使用 **Robust LM**；初值不可靠时使用 **Global + Robust LM**，弱峰或重叠峰可尝试导数模式。
-3.  **Start Fitting**: 点击开始拟合。等待进度条完成。
+适用于 Streamlit Cloud 或本地打开 `index.html`。
 
-### 5. 结果分析与导出
-*   拟合完成后，右侧绘图区会显示红色拟合曲线。
-*   点击 **Download Fitted Spectrum** 导出光谱数据。
-*   点击 **Download Fit Parameters** 导出拟合得到的物理参数。
+#### 1. 上传实验数据
+1. 打开网页应用。
+2. 在左侧栏找到 **1. Experimental Data**。
+3. 点击 **Upload Substrate Spectrum (Ref)**，选择空白衬底/参考区域的光谱。
+4. 点击 **Upload Sample Spectrum**，选择样品区域光谱。
+5. 等待界面显示 `Data ready`。程序会自动判断第一列是 nm 还是 eV，并把样品光谱插值到参考光谱网格上，然后计算 `(Rs - R0) / R0`。
+
+#### 2. 设置层结构和物理模型
+1. 找到 **2. Layer Stack & Model**。
+2. 在 **Structure preset** 中选择常用结构，例如：
+   - `Sample / SiO2 / Si`：二维材料在氧化硅/硅上。
+   - `hBN / Sample / hBN / SiO2 / Si`：hBN 封装样品。
+   - `Sample / Quartz`：石英衬底样品。
+3. 点击 **Apply**，用预设替换当前层表。
+4. 在层表中逐行编辑：
+   - **Order**：从入射侧到衬底侧的顺序。
+   - **Material**：选择 `Sample`、`hBN`、`Graphene`、`SiO2`、`Quartz`、`Sapphire` 或 `TiO2`。
+   - **Thickness (nm)**：该层厚度。
+   - **In reference**：勾选表示参考区域也包含该层；`Sample` 会自动不计入参考区域。
+   - **Fit**：勾选表示拟合该层厚度。
+   - **Min (nm)** / **Max (nm)**：厚度拟合上下界。
+5. 在 **Semi-infinite substrate** 中选择半无限衬底：`Si`、`Quartz`、`Sapphire` 或 `TiO2`。
+6. 在 **Exciton line shape** 中选择模型：
+   - **Voigt / Faddeeva (Recommended)**：推荐，分别拟合均匀展宽 `wL` 和非均匀展宽 `wG`。
+   - **Lorentz**：更简单，只使用一个 Lorentz 线宽。
+
+#### 3. 设置 ROI 和拟合算法
+1. 在左侧栏找到 **3. Fit Setup**。
+2. 输入 **ROI Min (eV)** 和 **ROI Max (eV)**，限定拟合能量范围。
+3. 查看 ROI 提示。如果 ROI 无效或点数太少，**Auto Guess** 和 **Run Fit** 会自动禁用。
+4. 选择 **Method**：
+   - **Robust LM (Recommended)**：默认推荐，适合大多数谱。
+   - **Global + Robust LM**：初始峰位不确定或多峰耦合严重时使用，速度较慢。
+   - **1st Derivative + LM** / **2nd Derivative + LM**：作为弱峰或重叠峰的辅助检查模式，已用内置 WSe2 示例做回归测试。
+5. 设置 **Optimization budget**：
+   - `3000`：快速测试。
+   - `8000`：普通拟合。
+   - `15000`：较难拟合或全局搜索时使用。
+
+#### 4. 添加或自动猜测激子峰
+1. 找到 **4. Exciton Resonances**。
+2. 点击 **Auto Guess**，程序会在 ROI 内自动找峰。算法会处理慢变背景，并用局部背景补漏弱峰。
+3. 点击 **Add Resonance** 可以手动增加一个振子。
+4. 在表格中输入或修改参数：
+   - **f (eV²)**：振子强度，必须 `>= 0`。
+   - **E0 (eV)**：峰位，必须为正。
+   - **wL (eV)**：Lorentz FWHM，必须为正。
+   - **wG (eV)**：Gaussian FWHM，仅 Voigt/Faddeeva 模型使用，必须为正。
+   - 参数旁边的 **锁定框**：勾选后该参数固定，不参与拟合。
+5. 点击 **Clear** 可以清空全部振子。
+
+#### 5. 运行拟合
+1. 确认数据已上传、ROI 有效、至少有一个振子、层结构没有错误。
+2. 点击 **Run Fit**。
+3. 观察进度提示：
+   - 校验层结构和参数。
+   - 导数模式下先进行原始谱 warm start。
+   - 优化光学参数和可拟合层厚。
+   - 计算不确定度和诊断指标。
+4. 如果之后修改数据、ROI、模型、层结构或振子表，旧拟合会自动失效，需要重新点击 **Run Fit**。
+
+#### 6. 查看拟合结果
+1. 在 **Fit Results** 中先看：
+   - **Global R2**
+   - **RMSE**
+   - **Durbin-Watson**
+   - 拟合方法和 Jacobian 条件数
+2. 再看 **Per-resonance diagnostics**：
+   - **Local R2**：每个峰附近的局部拟合质量。
+   - **Amplitude ratio**：拟合峰幅度 / 实验峰幅度。
+   - 如果全局 R2 很高但局部峰没拟合好，会出现 warning。
+3. 在 **5. Spectrum & Fit** 中查看图：
+   - 上图：实验点和拟合曲线。
+   - 下图：残差 `experiment - fit`。
+
+#### 7. 导出结果
+在 **Fit Results** 的 **Export** 区域点击：
+1. **Download Fitted Spectrum (CSV)**：导出能量、波长、实验对比度、拟合对比度、纯物理模型、baseline 和 residual。
+2. **Download Resonance Diagnostics (CSV)**：导出逐峰 local R2、amplitude ratio、质量标记和问题标签。
+3. **Download Fit Parameters (CSV)**：导出振子参数、标准误差和拟合得到的层厚。
+
+### 桌面版：一步一步操作
+
+适用于运行 `gui_app.py` 的 PyQt6 桌面程序。
+
+#### 1. 启动桌面程序
+1. 安装依赖：
+   ```bash
+   pip install numpy pandas scipy matplotlib PyQt6
+   ```
+2. 运行：
+   ```bash
+   python gui_app.py
+   ```
+
+#### 2. 载入数据
+1. 在 **1. Experimental Data** 中点击 **Choose Reference Spectrum...**，选择衬底/参考区域光谱。
+2. 点击 **Choose Sample Spectrum...**，选择样品区域光谱。
+3. 状态栏显示数据已就绪后，点击 **Plot Data Preview** 预览计算出的相对对比度。
+
+#### 3. 设置层结构
+1. 在 **2. Layer Stack (incident side -> substrate)** 中选择 **Substrate**。
+2. 选择 **Structure Preset**，点击 **Apply Preset**。
+3. 在层表中编辑：
+   - **Material**：层材料。
+   - **Thickness**：厚度 nm。
+   - **Ref**：参考区域是否包含该层。
+   - **Fit**：是否拟合该层厚度。
+   - **Min/Max**：厚度拟合上下界。
+4. 使用 **Add Layer**、**Remove**、**Move Up**、**Move Down** 组合任意层结构。层顺序同样是从入射侧到衬底侧。
+
+#### 4. 设置拟合选项
+1. 在 **3. Fit Setup** 中设置 ROI Min / ROI Max。
+2. 选择 **Fit Method**：
+   - **Robust LM (Recommended)**：默认推荐。
+   - **Global + Robust LM**：初值不确定时使用。
+   - **1st Derivative + LM** / **2nd Derivative + LM**：弱峰或重叠峰辅助检查。
+3. 选择 **Line Shape**：
+   - **Voigt / Faddeeva (Recommended)**：推荐。
+   - **Lorentz**：更简单的 Lorentz 模型。
+4. NA、温度、背景介电常数、E0 搜索半宽、baseline 阶数等高级参数默认隐藏或作为代码级默认值，普通使用不需要改。
+
+#### 5. 设置激子表
+1. 在 **4. Exciton Resonances** 中点击 **Auto Guess from ROI**，用 ROI 内自动识别的峰替换表格。
+2. 点击 **Add Exciton** 手动添加振子。
+3. 选中一行后点击 **Remove Selected** 删除振子。
+4. 编辑列：
+   - **f**：振子强度，必须 `>= 0`。
+   - **E0**：峰位 eV，必须为正。
+   - **wL**：Lorentz FWHM，必须为正。
+   - **wG**：Voigt 模型中的 Gaussian FWHM，必须为正。
+   - **Lock**：锁定对应参数。
+5. 如果输入负强度、负线宽或非正峰位，桌面版会在拟合前提示具体错误行。
+
+#### 6. 运行和查看拟合
+1. 点击 **Start Fitting**。
+2. 等待进度条完成。
+3. 拟合完成后图像和振子表会更新。
+4. 结果弹窗会显示：
+   - Global R2 / RMSE
+   - Jacobian 条件数
+   - Durbin-Watson
+   - 拟合层厚及误差
+   - 逐峰 local diagnostics
+   - 每个峰的 E0、线宽和标准误差
+
+#### 7. 保存和导出
+1. 点击 **Save Plot**，保存当前图为 PNG、JPG 或 PDF。
+2. 点击 **Export Data**，导出绘图/拟合数据为 CSV 或 TXT。
+3. 如果需要更完整的 resonance diagnostics CSV，建议使用 Web 版导出。
 
 ---
 ## 文件结构说明
@@ -143,7 +275,7 @@ The tool offers two modes of operation:
     *   2D Material: Monolayer or few-layer samples.
 *   **Advanced Optical Defaults**: temperature, finite NA, Si optical source, and background epsilon remain code-level parameters while the UI uses stable defaults.
 *   **Controlled Interpolation**: Si uses shape-preserving PCHIP in 400--1305 nm and passive endpoint-tangent linear extrapolation outside that range.
-*   **Complex Voigt Dielectric Function (recommended)**: Faddeeva oscillators separate Lorentzian homogeneous width $w_L$ from Gaussian inhomogeneous width $w_G$; the classical Lorentz model remains available.
+*   **Complex Voigt Dielectric Function (recommended)**: Faddeeva oscillators separate Lorentzian homogeneous width $w_L$ from Gaussian inhomogeneous width $w_G$; the classical Lorentz model remains available. Oscillator inputs are constrained to passive, physical values (`f >= 0`, `E_0 > 0`, positive linewidths).
   
   $$  
     \epsilon(E) = \epsilon_\infty + \sum_j \frac{f_j}{E_{0,j}^2 - E^2 - i E \Gamma_j}
@@ -160,16 +292,17 @@ The tool offers two modes of operation:
 *   **Weak-feature preservation**: resonance neighborhoods are balanced by their own detrended amplitudes and receive per-peak local $R^2$ and amplitude-recovery diagnostics.
 *   **Guided workflow**: data, layer stack, fit setup, resonances, and results are organized as explicit steps; unavailable actions are disabled and stale fits are invalidated automatically.
 *   **Variable-projection baseline**: cubic slow measurement drift is separated from nonlinear dielectric parameters.
-*   **Auto-Guess**: smoothed, detrended, noise-adaptive initialization that merges the peak/dip pair of one dispersive resonance.
+*   **Auto-Guess**: smoothed, detrended, noise-adaptive initialization that merges the peak/dip pair of one dispersive resonance. A secondary local-background pass helps recover weak peaks on curved interference backgrounds while filtering side-lobe duplicates near stronger peaks.
 *   **Constraints & Locking**: Supports parameter bounds and locking specific parameters (e.g., fixing a known peak position) during fitting.
-*   **Fit Diagnostics**: parameter standard errors, Jacobian condition number, RMSE, reduced chi-square, and Durbin-Watson residual statistics.
+*   **Fit Diagnostics**: parameter standard errors, Jacobian condition number, RMSE, reduced chi-square, Durbin-Watson residual statistics, per-resonance local $R^2$, amplitude-recovery ratio, and warnings when a high global $R^2$ hides a missed local feature.
 
 ### Full-spectrum example acceptance
 The WS2 example automatically initializes oscillators near `2.10`, `2.50`, and `3.06 eV`. Joint SiO2-thickness fitting with a cubic slow baseline has a full-range GOF ($R^2$) regression threshold of `0.99`; all three bundled Si datasets benchmark near `0.9944`, while 4--5 oscillators reach approximately `0.996--0.997`.
 
 ### 4. Export Results
-*   **Data Export**: Download experimental vs. fitted contrast data alongside wavelength/energy as CSV.
-*   **Parameter Export**: Download extracted physical parameters ($\epsilon_\infty, f, E_0, \Gamma$) as CSV.
+*   **Data Export**: Download energy, wavelength, experimental contrast, fitted contrast, physical-only model, fitted baseline, and residual (`experiment - fit`) as CSV.
+*   **Resonance Diagnostics Export**: Download per-resonance local $R^2$, amplitude ratio, quality flag, and issue labels as CSV.
+*   **Parameter Export**: Download extracted physical parameters ($\epsilon_\infty, f, E_0, \Gamma$ or $w_L/w_G$) and fitted layer thicknesses as CSV.
 
 ---
 
@@ -195,34 +328,167 @@ For developers or high-performance local computing.
 
 ## Usage Guide
 
-### 1. Data Preparation
-You need two sets of experimental data:
-*   **Substrate Spectrum (Ref)**: Reflection spectrum from a bare substrate region.
-*   **Sample Spectrum**: Reflection spectrum from the region with the 2D material.
-
-### 2. Load & Setup
-1.  **Upload Files**: Upload both spectra. The program calculates contrast:
+The fitted contrast definition is always
 
 $$
-    C_{exp} = C_{model} = \frac{R_{sample} - R_{sub}}{R_{sub}}
-    $$
-    
-3.  **Structure Config**: Define the physical structure (e.g., SiO2 thickness, hBN layers).
-4.  **Material Data**: Uses built-in Si (n,k) data by default. Custom data can be uploaded if needed.
+C = \frac{R_s - R_0}{R_0}
+$$
 
-### 3. Exciton Setup
-*   **Auto-Guess**: Click to automatically find peaks within the ROI.
-*   **Manual Add**: Manually add oscillators and adjust initial guesses.
-*   **Lock**: Use the "🔒" checkbox to fix known parameters.
+where `R0` is the reference/substrate-region reflectance and `Rs` is the sample-region reflectance. Input files should contain two numeric columns: wavelength in nm or photon energy in eV, and reflected intensity or contrast.
 
-### 4. Fitting
-1.  **ROI Range**: Set the energy range of interest (e.g., 1.5 eV - 3.0 eV).
-2.  **Method**: Start with **Robust LM**; use **Global + Robust LM** for uncertain initialization, or derivative modes for weak/overlapping peaks.
-3.  **Start Fitting**: Run the fit and wait for completion.
+### Web Version: Step-by-Step Operation
 
-### 5. Analysis
-*   View the red fitted curve overlaid on experimental data.
-*   Use the **Download** buttons to save spectra and parameters.
+Use this workflow for Streamlit Cloud or the local `index.html` web interface.
+
+#### 1. Load Experimental Data
+1. Open the web app.
+2. In the left sidebar, find **1. Experimental Data**.
+3. Click **Upload Substrate Spectrum (Ref)** and choose the reference spectrum from the bare substrate/reference region.
+4. Click **Upload Sample Spectrum** and choose the spectrum from the 2D-material/sample region.
+5. Wait for the message `Data ready`. The app automatically detects whether the first column is wavelength or energy, interpolates the sample spectrum to the reference grid, and computes `(Rs - R0) / R0`.
+
+#### 2. Set the Layer Stack and Optical Model
+1. Go to **2. Layer Stack & Model**.
+2. Pick a **Structure preset**. Typical choices are:
+   - `Sample / SiO2 / Si` for monolayer material on oxide/Si.
+   - `hBN / Sample / hBN / SiO2 / Si` for encapsulated samples.
+   - `Sample / Quartz` for transparent quartz substrates.
+3. Click **Apply** to replace the current layer table with the preset.
+4. Edit the layer table row by row:
+   - **Order**: incident side to substrate side.
+   - **Material**: choose `Sample`, `hBN`, `Graphene`, `SiO2`, `Quartz`, `Sapphire`, or `TiO2`.
+   - **Thickness (nm)**: physical layer thickness.
+   - **In reference**: checked means this layer is also present in the reference-region stack.
+   - **Fit**: checked means this thickness is fitted.
+   - **Min (nm)** and **Max (nm)**: bounds for fitted layer thickness.
+5. In **Optical model**, choose **Semi-infinite substrate** (`Si`, `Quartz`, `Sapphire`, or `TiO2`).
+6. Choose **Exciton line shape**:
+   - **Voigt / Faddeeva (Recommended)** separates homogeneous `wL` and inhomogeneous `wG` broadening.
+   - **Lorentz** uses one homogeneous linewidth.
+
+#### 3. Set ROI and Solver
+1. In the sidebar, go to **3. Fit Setup**.
+2. Set **ROI Min (eV)** and **ROI Max (eV)** around the spectral region to fit.
+3. Check the ROI message. The app disables Auto Guess and Run Fit if the ROI is invalid or contains too few points.
+4. Choose **Method**:
+   - **Robust LM (Recommended)**: default for most spectra.
+   - **Global + Robust LM**: slower, useful when initial guesses are poor.
+   - **1st Derivative + LM** or **2nd Derivative + LM**: useful as auxiliary modes for weak or overlapping features; these modes are regression-tested on the bundled WSe2 examples.
+5. Choose **Optimization budget**. Use `8000` for normal work, `15000` for hard fits, and `3000` for quick tests.
+
+#### 4. Add or Guess Exciton Resonances
+1. Go to **4. Exciton Resonances**.
+2. Click **Auto Guess** to detect resonances inside the ROI. The algorithm uses smoothed/global detrending plus a local-background pass to recover weak peaks on curved backgrounds.
+3. Click **Add Resonance** to add a manual oscillator.
+4. Edit the table:
+   - **f (eV²)**: oscillator strength. Must be non-negative.
+   - **E0 (eV)**: resonance energy.
+   - **wL (eV)**: Lorentzian FWHM.
+   - **wG (eV)**: Gaussian FWHM, shown for Voigt/Faddeeva.
+   - **lock checkbox** next to a parameter: keep that parameter fixed during fitting.
+5. Use **Clear** to remove all resonances and start over.
+
+#### 5. Run the Fit
+1. Confirm that files are loaded, the ROI is valid, at least one resonance exists, and the layer stack has no error.
+2. Click **Run Fit**.
+3. Watch the progress messages:
+   - parameter validation,
+   - optional warm start for derivative modes,
+   - nonlinear optical/layer optimization,
+   - uncertainty and diagnostics calculation.
+4. If model, layer, ROI, data, or resonance settings change later, the old fit is invalidated and the app asks you to run fitting again.
+
+#### 6. Read Results
+1. In **Fit Results**, check:
+   - **Global R2**,
+   - **RMSE**,
+   - **Durbin-Watson**,
+   - method name and Jacobian condition number.
+2. Check **Per-resonance diagnostics**:
+   - **Local R2** measures local shape agreement near each requested peak.
+   - **Amplitude ratio** measures fitted/measured local feature amplitude.
+   - A warning appears if global R2 is high but a local exciton feature is weakly fitted or amplitude-mismatched.
+3. In **5. Spectrum & Fit**, inspect:
+   - top panel: experiment and fitted curve,
+   - bottom panel: residual `experiment - fit`.
+
+#### 7. Export Results
+Use the buttons in **Fit Results**:
+1. **Download Fitted Spectrum (CSV)** exports energy, wavelength, experimental contrast, fitted contrast, physical-only model, fitted baseline, and residual.
+2. **Download Resonance Diagnostics (CSV)** exports per-resonance local R2, amplitude ratio, quality flag, and issue label.
+3. **Download Fit Parameters (CSV)** exports oscillator parameters, standard errors, and fitted layer thicknesses.
+
+### Desktop Version: Step-by-Step Operation
+
+Use this workflow for `gui_app.py`.
+
+#### 1. Start the Desktop App
+1. Install dependencies:
+   ```bash
+   pip install numpy pandas scipy matplotlib PyQt6
+   ```
+2. Run:
+   ```bash
+   python gui_app.py
+   ```
+
+#### 2. Load Data
+1. In **1. Experimental Data**, click **Choose Reference Spectrum...** and select the substrate/reference file.
+2. Click **Choose Sample Spectrum...** and select the sample file.
+3. The status line should indicate that data is ready.
+4. Click **Plot Data Preview** in **5. Run & Export** to inspect the computed relative contrast.
+
+#### 3. Configure the Layer Stack
+1. In **2. Layer Stack (incident side -> substrate)**, choose **Substrate**.
+2. If needed, choose a Si data source from the hidden/advanced Si-source control; default settings are recommended for normal use.
+3. Choose a **Structure Preset** and click **Apply Preset**.
+4. Edit the layer table:
+   - **Material**: select the layer material.
+   - **Thickness**: enter thickness in nm.
+   - **Ref**: include this layer in the reference stack.
+   - **Fit**: fit this layer thickness.
+   - **Min/Max**: bounds for thickness fitting.
+5. Use **Add Layer**, **Remove**, **Move Up**, and **Move Down** to build arbitrary stacks. The row order is incident side to substrate.
+
+#### 4. Configure Fit Setup
+1. In **3. Fit Setup**, set **ROI Min** and **ROI Max** in eV.
+2. Choose **Fit Method**:
+   - **Robust LM (Recommended)** for routine fitting.
+   - **Global + Robust LM** for uncertain initial guesses.
+   - **1st Derivative + LM** or **2nd Derivative + LM** for auxiliary derivative-domain checks.
+3. Choose **Line Shape**:
+   - **Voigt / Faddeeva (Recommended)** for separate `wL` and `wG`.
+   - **Lorentz** for a simpler homogeneous linewidth model.
+4. Keep hidden advanced defaults such as NA, temperature, background epsilon, E0 margin, and baseline order unless you are editing code-level behavior.
+
+#### 5. Enter Resonances
+1. In **4. Exciton Resonances**, click **Auto Guess from ROI** to replace the table with detected peaks.
+2. Click **Add Exciton** to add a manual oscillator.
+3. Select a row and click **Remove Selected** to delete it.
+4. Edit columns:
+   - **f**: oscillator strength, must be non-negative.
+   - **E0**: peak energy in eV, must be positive.
+   - **wL**: Lorentzian FWHM in eV, must be positive.
+   - **wG**: Gaussian FWHM in eV for Voigt, must be positive.
+   - **Lock** columns: fix the parameter during fitting.
+5. The desktop app rejects nonphysical resonance inputs before fitting and reports the invalid row.
+
+#### 6. Run and Inspect Fit
+1. Click **Start Fitting**.
+2. Wait for the progress bar to finish.
+3. The fit updates the plot and resonance table.
+4. Read the result dialog:
+   - global R2 and RMSE,
+   - Jacobian condition number,
+   - Durbin-Watson residual statistic,
+   - fitted layer thicknesses,
+   - per-peak local diagnostics,
+   - fitted oscillator parameters and standard errors.
+
+#### 7. Save or Export
+1. Click **Save Plot** to export the current figure as PNG, JPG, or PDF.
+2. Click **Export Data** to save the plotted/fitted data as CSV or TXT.
+3. Use the result dialog values for quick reporting; use the Web version when you need the richer resonance-diagnostics CSV exports.
 
 ---
 

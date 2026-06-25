@@ -49,6 +49,19 @@ class FittingEngineTests(unittest.TestCase):
         self.assertEqual(len(guesses), 1, msg=str(guesses))
         self.assertAlmostEqual(guesses[0, 0], 2.106, delta=0.01)
 
+    def test_auto_guess_finds_weak_peak_on_curved_background(self):
+        energy = np.linspace(1.55, 2.15, 1201)
+        interference = 0.08 * np.sin(2 * np.pi * (energy - energy[0]) / 0.55)
+        drift = 0.03 * (energy - np.mean(energy))
+        strong = 0.42 * np.exp(-0.5 * ((energy - 1.72) / 0.014) ** 2)
+        weak = 0.045 * np.exp(-0.5 * ((energy - 1.82) / 0.012) ** 2)
+        guesses = guess_resonances(
+            energy, interference + drift + strong + weak, max_peaks=4
+        )
+        self.assertGreaterEqual(len(guesses), 2, msg=str(guesses))
+        self.assertTrue(np.any(np.abs(guesses[:, 0] - 1.72) < 0.008), msg=str(guesses))
+        self.assertTrue(np.any(np.abs(guesses[:, 0] - 1.82) < 0.010), msg=str(guesses))
+
     def test_resonance_balancing_upweights_a_weak_local_feature(self):
         energy = np.linspace(1.6, 2.0, 801)
         strong = np.exp(-0.5 * ((energy - 1.72) / 0.008) ** 2)

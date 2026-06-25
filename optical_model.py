@@ -99,6 +99,8 @@ def dielectric_func_lorentz(energy_ev, params):
 
     epsilon = np.full(energy_ev.shape, params[0], dtype=complex)
     for strength, resonance, linewidth in params[1:].reshape(-1, 3):
+        if strength < 0 or resonance <= 0 or linewidth <= 0:
+            raise ValueError("Lorentz oscillators require f >= 0, E0 > 0, and gamma > 0")
         denominator = resonance**2 - energy_ev**2 - 1j * energy_ev * linewidth
         epsilon += strength / denominator
     return epsilon
@@ -119,6 +121,8 @@ def dielectric_func_voigt(energy_ev, params):
     root_ln2 = np.sqrt(np.log(2.0))
     prefactor_constant = 2j * np.sqrt(np.pi * np.log(2.0))
     for strength, resonance, lorentz_fwhm, gaussian_fwhm in params[1:].reshape(-1, 4):
+        if strength < 0 or resonance <= 0:
+            raise ValueError("Voigt oscillators require f >= 0 and E0 > 0")
         if lorentz_fwhm <= 0 or gaussian_fwhm <= 0:
             raise ValueError("Voigt linewidths must be positive")
         argument = (

@@ -252,15 +252,39 @@ def guess_resonances(
     feature = smooth - background
     prominence = max(5.0 * _noise_scale(values), 0.008 * np.ptp(feature))
     distance = max(1, int(np.ceil(min_separation_ev / spacing)))
-    positive, positive_properties = find_peaks(feature, prominence=prominence, distance=distance)
-    negative, negative_properties = find_peaks(-feature, prominence=prominence, distance=distance)
-    candidates = []
-    if positive.size:
-        widths = peak_widths(feature, positive, rel_height=0.5)[0] * spacing
-        candidates.extend(zip(positive, positive_properties["prominences"], widths))
-    if negative.size:
-        widths = peak_widths(-feature, negative, rel_height=0.5)[0] * spacing
-        candidates.extend(zip(negative, negative_properties["prominences"], widths))
+
+    def add_feature_candidates(feature_values, feature_prominence):
+        found = []
+        positive, positive_properties = find_peaks(
+            feature_values, prominence=feature_prominence, distance=distance
+        )
+        negative, negative_properties = find_peaks(
+            -feature_values, prominence=feature_prominence, distance=distance
+        )
+        if positive.size:
+            widths = peak_widths(feature_values, positive, rel_height=0.5)[0] * spacing
+            found.extend(zip(positive, positive_properties["prominences"], widths))
+        if negative.size:
+            widths = peak_widths(-feature_values, negative, rel_height=0.5)[0] * spacing
+            found.extend(zip(negative, negative_properties["prominences"], widths))
+        return found
+
+    candidates = add_feature_candidates(feature, prominence)
+    broad_window = odd_window(0.12, 31)
+    if broad_window > smooth_window:
+        local_background = savgol_filter(smooth, broad_window, min(3, broad_window - 2))
+        local_feature = smooth - local_background
+        local_prominence = max(4.0 * _noise_scale(local_feature), 0.006 * np.ptp(local_feature))
+        local_candidates = add_feature_candidates(local_feature, local_prominence)
+        for local in local_candidates:
+            local_energy = energy[local[0]]
+            local_width = float(local[2])
+            if all(
+                abs(local_energy - energy[global_candidate[0]])
+                >= max(peak_dip_merge_ev, 2.0 * max(local_width, float(global_candidate[2])))
+                for global_candidate in candidates
+            ):
+                candidates.append(local)
     if not candidates:
         return np.empty((0, 2))
     candidates = [
@@ -275,7 +299,12 @@ def guess_resonances(
     selected = []
     for candidate in candidates:
         candidate_energy = energy[candidate[0]]
-        if all(abs(candidate_energy - energy[item[0]]) >= peak_dip_merge_ev for item in selected):
+        candidate_width = float(candidate[2])
+        if all(
+            abs(candidate_energy - energy[item[0]])
+            >= max(peak_dip_merge_ev, 1.5 * max(candidate_width, float(item[2])))
+            for item in selected
+        ):
             selected.append(candidate)
         if len(selected) == max_peaks:
             break

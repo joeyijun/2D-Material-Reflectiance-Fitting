@@ -1,16 +1,9 @@
 
 import streamlit as st
+import inspect
 import numpy as np
 import pandas as pd
-from fitting_engine import (
-    composite_derivative_residual,
-    finalize_physical_fit,
-    fit_spectrum,
-    guess_resonances,
-    resonance_balanced_sigma,
-    resonance_diagnostics,
-    resonance_windows_from_parameters,
-)
+import fitting_engine as _fitting_engine
 from materials import read_si_optical_constants
 from optical_model import (
     HC_EV_NM,
@@ -29,6 +22,99 @@ import matplotlib.pyplot as plt
 import os
 import re
 import sys
+
+LOCAL_R2_WARNING_THRESHOLD = 0.90
+AMPLITUDE_RATIO_WARNING_RANGE = (0.70, 1.30)
+
+fit_spectrum = _fitting_engine.fit_spectrum
+guess_resonances = _fitting_engine.guess_resonances
+
+
+def _fallback_resonance_windows(params, line_shape):
+    params = np.asarray(params, dtype=float)
+    if str(line_shape).lower() == "voigt":
+        rows = params[1:].reshape(-1, 4)
+        widths = 0.5346 * rows[:, 2] + np.sqrt(0.2166 * rows[:, 2] ** 2 + rows[:, 3] ** 2)
+    else:
+        rows = params[1:].reshape(-1, 3)
+        widths = rows[:, 2]
+    return [(float(row[1]), float(width)) for row, width in zip(rows, widths)]
+
+
+def _fallback_balanced_sigma(energy_ev, measured, resonances):
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    measured = np.asarray(measured, dtype=float)
+    global_scale = max(float(np.std(measured)), np.finfo(float).eps)
+    sigma = np.full(measured.shape, global_scale)
+    for center, fwhm in resonances:
+        radius = float(np.clip(2.0 * max(float(fwhm), 0.005), 0.02, 0.08))
+        mask = np.abs(energy_ev - float(center)) <= radius
+        if np.count_nonzero(mask) < 7:
+            continue
+        x = energy_ev[mask]
+        x = (x - np.mean(x)) / max(np.ptp(x), 1e-12)
+        trend = np.polyval(np.polyfit(x, measured[mask], 1), x)
+        local_scale = max(float(np.std(measured[mask] - trend)), np.finfo(float).eps)
+        sigma[mask] = np.minimum(sigma[mask], local_scale)
+    return sigma
+
+
+def _fallback_resonance_diagnostics(energy_ev, measured, fitted, resonances):
+    diagnostics = []
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    measured = np.asarray(measured, dtype=float)
+    fitted = np.asarray(fitted, dtype=float)
+    for center, fwhm in resonances:
+        radius = float(np.clip(2.0 * max(float(fwhm), 0.005), 0.02, 0.08))
+        mask = np.abs(energy_ev - float(center)) <= radius
+        if np.count_nonzero(mask) < 7:
+            continue
+        x = energy_ev[mask]
+        x = (x - np.mean(x)) / max(np.ptp(x), 1e-12)
+        measured_feature = measured[mask] - np.polyval(np.polyfit(x, measured[mask], 1), x)
+        fitted_feature = fitted[mask] - np.polyval(np.polyfit(x, fitted[mask], 1), x)
+        rss = float(np.sum((fitted_feature - measured_feature) ** 2))
+        total = float(np.sum(measured_feature**2))
+        amplitude = float(np.ptp(measured_feature))
+        diagnostics.append({
+            "center_ev": float(center),
+            "local_r_squared": 1.0 - rss / total if total > 0 else np.nan,
+            "amplitude_ratio": float(np.ptp(fitted_feature)) / amplitude if amplitude > 0 else np.nan,
+            "points": int(np.count_nonzero(mask)),
+        })
+    return diagnostics
+
+
+resonance_windows_from_parameters = getattr(
+    _fitting_engine, "resonance_windows_from_parameters", _fallback_resonance_windows
+)
+resonance_balanced_sigma = getattr(
+    _fitting_engine, "resonance_balanced_sigma", _fallback_balanced_sigma
+)
+resonance_diagnostics = getattr(
+    _fitting_engine, "resonance_diagnostics", _fallback_resonance_diagnostics
+)
+
+_base_composite_derivative_residual = _fitting_engine.composite_derivative_residual
+_composite_accepts_resonances = (
+    "resonances" in inspect.signature(_base_composite_derivative_residual).parameters
+)
+
+
+def composite_derivative_residual(*args, resonances=None, **kwargs):
+    if _composite_accepts_resonances:
+        kwargs["resonances"] = resonances
+    return _base_composite_derivative_residual(*args, **kwargs)
+
+
+_base_finalize_physical_fit = _fitting_engine.finalize_physical_fit
+_finalize_accepts_sigma = "sigma" in inspect.signature(_base_finalize_physical_fit).parameters
+
+
+def finalize_physical_fit(*args, sigma=None, **kwargs):
+    if _finalize_accepts_sigma:
+        kwargs["sigma"] = sigma
+    return _base_finalize_physical_fit(*args, **kwargs)
 
 # --- Material Loader Class (Adapted) ---
 class MaterialLoader:
@@ -377,6 +463,78 @@ def make_model_signature(model_config):
     )
 
 
+def make_data_signature(energy_ev, contrast, reference_file, sample_file):
+    if energy_ev is None or contrast is None:
+        return None
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    contrast = np.asarray(contrast, dtype=float)
+    return (
+        getattr(reference_file, "name", None),
+        getattr(reference_file, "size", None),
+        getattr(sample_file, "name", None),
+        getattr(sample_file, "size", None),
+        int(energy_ev.size),
+        round(float(np.nanmin(energy_ev)), 8),
+        round(float(np.nanmax(energy_ev)), 8),
+        round(float(np.nanmean(contrast)), 10),
+        round(float(np.nanstd(contrast)), 10),
+    )
+
+
+def make_fit_context_signature(data_signature, roi_min, roi_max, method, max_nfev):
+    return (
+        data_signature,
+        round(float(roi_min), 8),
+        round(float(roi_max), 8),
+        method,
+        int(max_nfev),
+        baseline_order,
+        round(float(e0_margin), 8),
+    )
+
+
+def validate_roi(energy_ev, roi_min, roi_max, minimum_points=7):
+    if roi_min >= roi_max:
+        return None, "ROI Min must be smaller than ROI Max."
+    if energy_ev is None:
+        return None, None
+    energy_ev = np.asarray(energy_ev, dtype=float)
+    mask = (energy_ev >= roi_min) & (energy_ev <= roi_max)
+    points = int(np.count_nonzero(mask))
+    if points < minimum_points:
+        return mask, f"ROI contains only {points} points; use at least {minimum_points} points."
+    return mask, None
+
+
+def local_fit_quality_warnings(diagnostics):
+    return [item["message"] for item in local_fit_quality_flags(diagnostics)]
+
+
+def local_fit_quality_flags(diagnostics):
+    flags = []
+    low_amplitude, high_amplitude = AMPLITUDE_RATIO_WARNING_RANGE
+    for index, diagnostic in enumerate(diagnostics, start=1):
+        center = diagnostic.get("center_ev", np.nan)
+        local_r2 = diagnostic.get("local_r_squared", np.nan)
+        amplitude_ratio = diagnostic.get("amplitude_ratio", np.nan)
+        if np.isfinite(local_r2) and local_r2 < LOCAL_R2_WARNING_THRESHOLD:
+            message = (
+                f"Peak {index} ({center:.4f} eV) has weak local fit quality: "
+                f"Local R2={local_r2:.3f}."
+            )
+            flags.append({"peak": index, "kind": "low_local_r2", "message": message})
+        if (
+            np.isfinite(amplitude_ratio)
+            and not low_amplitude <= amplitude_ratio <= high_amplitude
+        ):
+            message = (
+                f"Peak {index} ({center:.4f} eV) amplitude is mismatched: "
+                f"fit/measured={amplitude_ratio:.2f}."
+            )
+            flags.append({"peak": index, "kind": "amplitude_mismatch", "message": message})
+    return flags
+
+
 model_signature = make_model_signature(config)
 if 'fit_results' in st.session_state:
     stored = st.session_state.fit_results
@@ -462,6 +620,10 @@ if uploaded_sub_file and uploaded_samp_file:
 else:
     st.info("Upload both reference and sample spectra in the sidebar to enable Auto Guess and fitting.")
 
+data_signature = make_data_signature(
+    x_exp_ev, y_exp_contrast, uploaded_sub_file, uploaded_samp_file
+)
+
 # Sidebar - Fitting
 st.sidebar.header("3. Fit Setup")
 
@@ -473,6 +635,11 @@ if x_exp_ev is not None:
 
 roi_min = st.sidebar.number_input("ROI Min (eV)", value=def_min, format="%.2f")
 roi_max = st.sidebar.number_input("ROI Max (eV)", value=def_max, format="%.2f")
+roi_mask, roi_error = validate_roi(x_exp_ev, roi_min, roi_max)
+if roi_error:
+    st.sidebar.error(roi_error)
+elif roi_mask is not None:
+    st.sidebar.caption(f"ROI points: {int(np.count_nonzero(roi_mask))}")
 fit_method = st.sidebar.selectbox("Method", [
     "Robust LM (Recommended)",
     "Global + Robust LM",
@@ -486,6 +653,18 @@ max_nfev = st.sidebar.select_slider(
 )
 config['fit_method'] = fit_method
 config['high_precision'] = (fit_method == "Global + Robust LM")
+
+fit_context_signature = make_fit_context_signature(
+    data_signature, roi_min, roi_max, fit_method, max_nfev
+)
+if 'fit_results' in st.session_state:
+    stored_context_signature = (
+        st.session_state.fit_results[7]
+        if len(st.session_state.fit_results) >= 8 else None
+    )
+    if stored_context_signature != fit_context_signature:
+        del st.session_state.fit_results
+        st.sidebar.info("Data or fitting setup changed. Run the fit again.")
 
 
 
@@ -524,7 +703,10 @@ with col1:
 
         try:
             # Use ROI
-            mask = (x_exp_ev >= roi_min) & (x_exp_ev <= roi_max)
+            if roi_error:
+                st.error(roi_error)
+                return
+            mask = roi_mask
             y_roi = y_exp_contrast[mask]
             x_roi = x_exp_ev[mask]
             
@@ -559,15 +741,15 @@ with col1:
     )
     col_btn3.button(
         "Auto Guess", on_click=auto_guess_excitons, use_container_width=True,
-        disabled=x_exp_ev is None,
+        disabled=x_exp_ev is None or roi_error is not None,
     )
     
     # Configure columns for better UI
     column_config = {
-        "f": st.column_config.NumberColumn("f (eV²)", format="%.4f"),
-        "E0": st.column_config.NumberColumn("E0 (eV)", format="%.4f"),
-        "wL": st.column_config.NumberColumn("wL (eV)", format="%.4f"),
-        "wG": st.column_config.NumberColumn("wG (eV)", format="%.4f"),
+        "f": st.column_config.NumberColumn("f (eV²)", min_value=0.0, format="%.4f"),
+        "E0": st.column_config.NumberColumn("E0 (eV)", min_value=0.0, format="%.4f"),
+        "wL": st.column_config.NumberColumn("wL (eV)", min_value=0.0001, format="%.4f"),
+        "wG": st.column_config.NumberColumn("wG (eV)", min_value=0.0001, format="%.4f"),
         "🔒f": st.column_config.CheckboxColumn("🔒", width="small"),
         "🔒E0": st.column_config.CheckboxColumn("🔒", width="small"),
         "🔒wL": st.column_config.CheckboxColumn("🔒", width="small"),
@@ -610,13 +792,18 @@ with col1:
 
     if st.button(
         "Run Fit", type="primary", use_container_width=True,
-        disabled=(x_exp_ev is None or edited_df.empty or structure_error is not None),
+        disabled=(
+            x_exp_ev is None or edited_df.empty
+            or structure_error is not None or roi_error is not None
+        ),
     ):
         if x_exp_ev is None:
             st.error("Please upload both Substrate and Sample spectra first!")
+        elif roi_error:
+            st.error(roi_error)
         else:
             # Filter range
-            mask = (x_exp_ev >= roi_min) & (x_exp_ev <= roi_max)
+            mask = roi_mask
             # x for fitting (model expects nm for TMM but lorentz takes eV)
             # Convert the energy axis back to nm for the optical model.
             x_fit_nm = HC_EV_NM / x_exp_ev[mask]
@@ -818,6 +1005,7 @@ with col1:
                         fitted_config,
                         make_model_signature(fitted_config),
                         make_exciton_signature(st.session_state.excitons),
+                        fit_context_signature,
                     )
                     st.rerun()
                     
@@ -828,7 +1016,9 @@ with col1:
     if 'fit_results' in st.session_state:
         st.divider()
         st.subheader("Fit Results")
-        x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _, _ = st.session_state.fit_results
+        x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _, _ = (
+            st.session_state.fit_results[:7]
+        )
 
         # Recalculate y_model for consistency
         # Warning: scope. Let's re-calculate basics.
@@ -839,6 +1029,8 @@ with col1:
             x_fit_nm_res, eps_model_e, loader, fitted_config
         )
         y_model_e = fit_result.add_baseline(physical_model_e, x_ev_export)
+        baseline_e = y_model_e - physical_model_e
+        residual_e = y_fit_exp_res - y_model_e
 
         metric_r2, metric_rmse, metric_dw = st.columns(3)
         metric_r2.metric("Global R2", f"{fit_result.r_squared:.5f}")
@@ -850,18 +1042,33 @@ with col1:
         local_diagnostics = getattr(fit_result, "resonance_diagnostics", [])
         if local_diagnostics:
             st.markdown("**Per-resonance diagnostics**")
+            local_quality_flags = local_fit_quality_flags(local_diagnostics)
+            issue_by_peak = {}
+            for flag in local_quality_flags:
+                issue_by_peak.setdefault(flag["peak"], []).append(flag["kind"])
+            diagnostics_df = pd.DataFrame([
+                {
+                    "Peak": index,
+                    "Center (eV)": diagnostic["center_ev"],
+                    "Local R2": diagnostic["local_r_squared"],
+                    "Amplitude ratio": diagnostic["amplitude_ratio"],
+                    "Quality flag": (
+                        "Check" if index in issue_by_peak else "OK"
+                    ),
+                    "Issue": "; ".join(issue_by_peak.get(index, [])),
+                }
+                for index, diagnostic in enumerate(local_diagnostics, start=1)
+            ])
             st.dataframe(
-                pd.DataFrame([
-                    {
-                        "Peak": index,
-                        "Center (eV)": diagnostic["center_ev"],
-                        "Local R2": diagnostic["local_r_squared"],
-                        "Amplitude ratio": diagnostic["amplitude_ratio"],
-                    }
-                    for index, diagnostic in enumerate(local_diagnostics, start=1)
-                ]),
+                diagnostics_df,
                 hide_index=True, use_container_width=True,
             )
+            warning_lines = local_fit_quality_warnings(local_diagnostics)
+            if warning_lines:
+                st.warning(
+                    "Global R2 can hide missed exciton features:\n\n"
+                    + "\n".join(f"- {line}" for line in warning_lines)
+                )
         fitted_layer_rows = [
             (index, layer) for index, layer in enumerate(fitted_config['layers']) if layer['fit']
         ]
@@ -880,7 +1087,10 @@ with col1:
             "Energy_eV": x_ev_export,
             "Wavelength_nm": x_fit_nm_res,
             "Contrast_Exp": y_fit_exp_res,
-            "Contrast_Fit": y_model_e
+            "Contrast_Fit": y_model_e,
+            "Contrast_PhysicalModel": physical_model_e,
+            "Baseline": baseline_e,
+            "Residual_ExpMinusFit": residual_e,
         })
         csv_spec = export_df.to_csv(index=False).encode('utf-8')
         st.download_button(
@@ -890,6 +1100,16 @@ with col1:
             "text/csv",
             key='download-spectrum'
         )
+
+        if local_diagnostics:
+            csv_diag = diagnostics_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "Download Resonance Diagnostics (CSV)",
+                csv_diag,
+                "fit_resonance_diagnostics.csv",
+                "text/csv",
+                key='download-diagnostics'
+            )
         
         # 2. Export Parameters
         params_export = []
@@ -922,18 +1142,31 @@ with col1:
 
 with col2:
     st.subheader("5. Spectrum & Fit")
-    
-    fig, ax = plt.subplots()
-    ax.set_xlabel("Energy (eV)")
+
+    has_fit = 'fit_results' in st.session_state
+    if has_fit:
+        fig, (ax, ax_residual) = plt.subplots(
+            2, 1, sharex=True, figsize=(7, 5),
+            gridspec_kw={"height_ratios": [3, 1]}
+        )
+        ax_residual.set_xlabel("Energy (eV)")
+        ax_residual.set_ylabel("Residual")
+    else:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax_residual = None
+        ax.set_xlabel("Energy (eV)")
     ax.set_ylabel("Contrast")
     
     # Plot experimental data
     if x_exp_ev is not None:
         ax.plot(x_exp_ev, y_exp_contrast, 'k.', label='Experiment', markersize=2)
+        y_model = None
         
         # Plot Fit
-        if 'fit_results' in st.session_state:
-            x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _, _ = st.session_state.fit_results
+        if has_fit:
+            x_fit_nm_res, y_fit_exp_res, p_final, fit_result, fitted_config, _, _ = (
+                st.session_state.fit_results[:7]
+            )
             # Show Fit
             wl_full = HC_EV_NM / x_exp_ev
             dielectric_model = dielectric_func_voigt if fitted_config.get('line_shape') == 'Voigt' else dielectric_func_lorentz
@@ -943,16 +1176,30 @@ with col2:
             )
             y_model = fit_result.add_baseline(physical_model, x_exp_ev)
             ax.plot(x_exp_ev, y_model, 'r-', label='Fit', linewidth=2)
+            residual = y_exp_contrast - y_model
+            ax_residual.axhline(0.0, color='0.5', linewidth=0.8)
+            ax_residual.plot(x_exp_ev, residual, color='tab:blue', linewidth=1.0)
 
-        ax.set_xlim(roi_min, roi_max)
+        if roi_error:
+            ax.set_xlim(np.min(x_exp_ev), np.max(x_exp_ev))
+        else:
+            ax.set_xlim(roi_min, roi_max)
         
         # Auto ylim
-        mask = (x_exp_ev >= roi_min) & (x_exp_ev <= roi_max)
+        mask = roi_mask if roi_mask is not None else np.ones_like(x_exp_ev, dtype=bool)
         if np.any(mask):
-            y_roi = y_exp_contrast[mask]
+            y_roi = (
+                np.concatenate([y_exp_contrast[mask], y_model[mask]])
+                if y_model is not None else y_exp_contrast[mask]
+            )
             ymin, ymax = np.min(y_roi), np.max(y_roi)
             margin = (ymax - ymin) * 0.1 if (ymax!=ymin) else 0.1
             ax.set_ylim(ymin - margin, ymax + margin)
+            if ax_residual is not None:
+                residual_roi = residual[mask]
+                residual_abs = np.max(np.abs(residual_roi))
+                residual_margin = residual_abs * 1.1 if residual_abs > 0 else 0.01
+                ax_residual.set_ylim(-residual_margin, residual_margin)
             
     ax.legend()
     st.pyplot(fig)

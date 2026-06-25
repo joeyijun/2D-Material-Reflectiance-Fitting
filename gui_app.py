@@ -894,6 +894,8 @@ class MainWindow(QMainWindow):
 
     def on_model_configuration_changed(self, *_args):
         """Invalidate a displayed fit when model inputs change."""
+        if getattr(self, '_updating_fit_results', False):
+            return
         if not hasattr(self, 'last_y_fit') or self.last_y_fit is None:
             return
         if hasattr(self, 'worker') and self.worker.isRunning():
@@ -1270,8 +1272,12 @@ class MainWindow(QMainWindow):
                     f = float(self.table_exc.item(r, 0).text())
                     E0 = float(self.table_exc.item(r, 2).text())
                     g = float(self.table_exc.item(r, 4).text())
+                    if f < 0 or E0 <= 0 or g <= 0:
+                        raise ValueError("f must be >= 0; E0 and wL must be > 0")
                     if struct_config['line_shape'] == 'Voigt':
                         wg = float(self.table_exc.item(r, 6).text())
+                        if wg <= 0:
+                            raise ValueError("wG must be > 0")
                         p0.extend([f, E0, g, wg])
                     else:
                         p0.extend([f, E0, g])
@@ -1286,8 +1292,11 @@ class MainWindow(QMainWindow):
                         locks.append(self._get_lock_state(r, 7))
                     locked_mask.extend(locks)
                     
-                except ValueError:
-                     QMessageBox.warning(self, "Warning", f"Invalid number in Exciton Row {r+1}. Skipping.")
+                except ValueError as exc:
+                     QMessageBox.warning(
+                         self, "Warning",
+                         f"Invalid exciton parameters in row {r+1}: {exc}"
+                     )
             
             if len(p0) < 4:
                 QMessageBox.warning(self, "Warning", "Need at least one exciton to fit.")
@@ -1390,6 +1399,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def on_fit_finished(self, x_data, y_data, y_fit, popt, r_squared, locked_mask):
+        self._updating_fit_results = True
         self.btn_fit.setEnabled(True)
         self.btn_fit.setText("Start Fitting")
         self.btn_fit.setStyleSheet("") # Reset Color
@@ -1451,6 +1461,7 @@ class MainWindow(QMainWindow):
             l_wg = locked_mask[base + 3] if stride == 4 else False
             
             self.add_exciton_values(round(f, 4), round(E0, 4), round(gamma, 4), round(gaussian, 4), locks=(l_f, l_E0, l_g, l_wg))
+        self._updating_fit_results = False
         
         result = self.last_fit_result
         msg = f"Fitting completed successfully!\nR-squared: {r_squared:.4f}"
