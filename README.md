@@ -8,6 +8,14 @@
 1.  **Web 版 (Streamlit)**: 无需安装复杂环境，单文件 (`index.html`) 即可运行，支持离线使用，界面现代友好。
 2.  **桌面版 (PyQt6)**: 功能最全，适合需要批量处理和深度定制的高级用户。
 
+## 拟合效果展示 (Example Results)
+
+下图展示了实验点、拟合曲线和 residual，可以直观看到模型对强激子峰、色散线形以及慢变背景的拟合效果。
+
+| MoSe2 example | WS2 example |
+| --- | --- |
+| ![MoSe2 optical contrast fit](example/MoSe2.png) | ![WS2 optical contrast fit](example/WS2.png) |
+
 ---
 
 ## 核心功能 (Key Features)
