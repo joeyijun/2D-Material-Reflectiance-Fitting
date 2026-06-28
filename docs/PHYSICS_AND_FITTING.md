@@ -28,16 +28,16 @@ $$
 
 ```mermaid
 flowchart TD
-    A[导入 reference 光谱 R0] --> C[单位识别与数据清洗]
-    B[导入 sample 光谱 Rs] --> C
-    C --> D[插值到同一波长/能量网格]
-    D --> E[计算实验对比度 C=(Rs-R0)/R0]
-    E --> F[设置层结构与 reference inclusion]
-    F --> G[选择 Lorentz 或 Voigt 激子介电函数]
-    G --> H[Auto Guess 或手动输入激子初值]
-    H --> I[构建 TMM sample/reference 模型]
-    I --> J[非线性拟合 + baseline variable projection]
-    J --> K[输出拟合曲线、残差、参数、局部峰诊断]
+    A["导入 reference 光谱 R0"] --> C["单位识别与数据清洗"]
+    B["导入 sample 光谱 Rs"] --> C
+    C --> D["插值到同一波长或能量网格"]
+    D --> E["计算实验对比度"]
+    E --> F["设置层结构与 reference inclusion"]
+    F --> G["选择 Lorentz 或 Voigt 激子模型"]
+    G --> H["Auto Guess 或手动输入激子初值"]
+    H --> I["构建 TMM sample/reference 模型"]
+    I --> J["非线性拟合与 baseline projection"]
+    J --> K["输出曲线、残差、参数和局部诊断"]
 ```
 
 代码入口主要对应：
@@ -110,18 +110,18 @@ $$
 ```mermaid
 flowchart LR
     subgraph Sample_stack["Sample 区域 Rs"]
-        A1[Air] --> B1[hBN top]
-        B1 --> C1[Sample: 2D material]
-        C1 --> D1[hBN bottom]
-        D1 --> E1[SiO2]
-        E1 --> F1[Si substrate]
+        A1["Air"] --> B1["hBN top"]
+        B1 --> C1["Sample 2D material"]
+        C1 --> D1["hBN bottom"]
+        D1 --> E1["SiO2"]
+        E1 --> F1["Si substrate"]
     end
 
     subgraph Reference_stack["Reference 区域 R0"]
-        A2[Air] --> B2[hBN top, if In reference]
-        B2 --> D2[hBN bottom, if In reference]
-        D2 --> E2[SiO2]
-        E2 --> F2[Si substrate]
+        A2["Air"] --> B2["hBN top if in reference"]
+        B2 --> D2["hBN bottom if in reference"]
+        D2 --> E2["SiO2"]
+        E2 --> F2["Si substrate"]
     end
 ```
 
@@ -293,15 +293,15 @@ Auto Guess 的目标不是最终拟合，而是给非线性拟合一个合理初
 
 ```mermaid
 flowchart TD
-    A[ROI 内实验 contrast] --> B[按能量排序]
-    B --> C[Savitzky-Golay 平滑]
-    C --> D[低阶背景拟合并扣除]
-    D --> E[估计鲁棒噪声 floor]
-    E --> F[同时寻找 peak 和 dip]
-    F --> G[估计半高宽]
-    G --> H[合并同一色散共振的峰谷对]
-    H --> I[过滤过宽、太靠边、过近的候选]
-    I --> J[输出 E0 和初始 linewidth]
+    A["ROI 内实验 contrast"] --> B["按能量排序"]
+    B --> C["Savitzky-Golay 平滑"]
+    C --> D["扣除低阶背景"]
+    D --> E["估计鲁棒噪声 floor"]
+    E --> F["同时寻找 peak 和 dip"]
+    F --> G["估计半高宽"]
+    G --> H["合并同一共振的峰谷对"]
+    H --> I["过滤过宽、靠边或过近的候选"]
+    I --> J["输出 E0 和初始 linewidth"]
 ```
 
 这样做的原因是 optical contrast 的激子不一定表现为简单吸收峰。由于多层干涉，单个激子可能表现为峰、谷或色散型峰谷组合。
@@ -386,13 +386,13 @@ $$
 
 ```mermaid
 flowchart TD
-    A[初始参数 p0] --> B[检查 bounds 和 lock]
-    B --> C[TRF bounded least_squares]
-    C --> D[soft_l1 loss 抑制异常点]
-    D --> E[Huber 权重估计]
-    E --> F[logistic transform 保持参数在 bounds 内]
-    F --> G[Levenberg-Marquardt 精修]
-    G --> H[协方差、标准误差和诊断]
+    A["初始参数 p0"] --> B["检查 bounds 和 lock"]
+    B --> C["TRF bounded least_squares"]
+    C --> D["soft_l1 loss 抑制异常点"]
+    D --> E["Huber 权重估计"]
+    E --> F["logistic transform 保持 bounds"]
+    F --> G["Levenberg-Marquardt 精修"]
+    G --> H["协方差、标准误差和诊断"]
 ```
 
 关键点：
