@@ -8,6 +8,7 @@ from materials import read_si_optical_constants
 from optical_model import (
     HC_EV_NM,
     LAYER_MATERIALS,
+    SUBSTRATE_MATERIALS,
     calculate_contrast_dynamic as calculate_contrast_core,
     config_with_layer_thicknesses,
     dielectric_func_lorentz as dielectric_func_lorentz_core,
@@ -15,6 +16,7 @@ from optical_model import (
     layer_fit_parameters,
     normalized_layer_stack,
     spectral_derivative,
+    substrate_type_from_config,
 )
 from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.signal import find_peaks
@@ -355,20 +357,27 @@ layer_presets = {
     "Sample / SiO2 / Si": [
         ["Sample", 0.65, False, False, 0.1, 2.0],
         ["SiO2", 285.0, True, True, 265.0, 305.0],
+        ["Si", 0.0, True, False, 0.0, 0.0001],
+    ],
+    "Sample / Quartz": [
+        ["Sample", 0.65, False, False, 0.1, 2.0],
+        ["Quartz", 0.0, True, False, 0.0, 0.0001],
     ],
     "hBN / Sample / hBN / SiO2 / Si": [
-        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
         ["Sample", 0.65, False, False, 0.1, 2.0],
-        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
         ["SiO2", 285.0, True, True, 265.0, 305.0],
+        ["Si", 0.0, True, False, 0.0, 0.0001],
     ],
     "hBN / Graphene / Sample / Graphene / hBN / SiO2 / Si": [
-        ["hBN", 10.0, False, True, 0.0, 100.0],
-        ["Graphene", 0.335, False, False, 0.1, 2.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
+        ["Graphene", 0.335, True, False, 0.1, 2.0],
         ["Sample", 0.65, False, False, 0.1, 2.0],
-        ["Graphene", 0.335, False, False, 0.1, 2.0],
-        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["Graphene", 0.335, True, False, 0.1, 2.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
         ["SiO2", 285.0, True, True, 265.0, 305.0],
+        ["Si", 0.0, True, False, 0.0, 0.0001],
     ],
 }
 layer_columns = ["Order", "Material", "Thickness (nm)", "In reference", "Fit", "Min (nm)", "Max (nm)"]
@@ -423,7 +432,9 @@ with structure_col:
 
 with optics_col:
     st.markdown("**Optical model**")
-    sub_type = st.selectbox("Semi-infinite substrate", ["Si", "Quartz", "Sapphire", "TiO2"])
+    st.caption(
+        "Set the semi-infinite substrate as the final zero-thickness row in the layer table."
+    )
     line_shape = st.selectbox(
         "Exciton line shape", ["Voigt / Faddeeva (Recommended)", "Lorentz"]
     )
@@ -439,6 +450,7 @@ layers = [
      "min_nm": row["Min (nm)"], "max_nm": row["Max (nm)"]}
     for _, row in layer_df.sort_values("Order").iterrows()
 ]
+sub_type = substrate_type_from_config({'substrate_type': 'Si', 'layers': layers})
 config = {
     'substrate_type': sub_type, 'temp': temperature, 'layers': layers,
     'numerical_aperture': numerical_aperture, 'contrast_definition': 'relative'

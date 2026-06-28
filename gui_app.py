@@ -27,12 +27,14 @@ from fitting_engine import (
 from optical_model import (
     HC_EV_NM,
     LAYER_MATERIALS,
+    SUBSTRATE_MATERIALS,
     calculate_contrast_dynamic as calculate_contrast_core,
     config_with_layer_thicknesses,
     dielectric_func_lorentz as dielectric_func_lorentz_core,
     dielectric_func_voigt,
     layer_fit_parameters,
     spectral_derivative,
+    substrate_type_from_config,
 )
 from scipy.interpolate import interp1d
 
@@ -504,6 +506,7 @@ class MainWindow(QMainWindow):
         self.combo_sub = QComboBox()
         self.combo_sub.addItems(["Si", "Quartz", "Sapphire", "TiO2"])
         self.combo_sub.currentIndexChanged.connect(self.on_substrate_changed)
+        self.combo_sub.hide()
 
         self.combo_si_data = QComboBox()
         for filename in ("Si_data.csv", "Schinke.csv", "Green-2008.csv"):
@@ -548,13 +551,11 @@ class MainWindow(QMainWindow):
         ):
             advanced_widget.hide()
 
-        form_struct.addRow("Semi-infinite substrate:", self.combo_sub)
-        struct_layout.addLayout(form_struct)
-
         preset_row = QHBoxLayout()
         self.combo_structure_preset = QComboBox()
         self.combo_structure_preset.addItems([
             "Sample / SiO2 / Si",
+            "Sample / Quartz",
             "hBN / Sample / hBN / SiO2 / Si",
             "hBN / Graphene / Sample / Graphene / hBN / SiO2 / Si",
         ])
@@ -567,7 +568,7 @@ class MainWindow(QMainWindow):
         struct_layout.addLayout(preset_row)
 
         layer_hint = QLabel(
-            "Top-to-bottom order. Enable Fit only for unknown thicknesses."
+            "Top-to-bottom order. The final zero-thickness Si/Quartz/Sapphire/TiO2 row is the semi-infinite substrate."
         )
         layer_hint.setWordWrap(True)
         layer_hint.setStyleSheet("color: #666;")
@@ -594,7 +595,7 @@ class MainWindow(QMainWindow):
         for column, help_text in layer_header_help.items():
             self.table_layers.horizontalHeaderItem(column).setToolTip(help_text)
         self.table_layers.setMinimumHeight(100)
-        self.table_layers.setMaximumHeight(130)
+        self.table_layers.setMaximumHeight(165)
         struct_layout.addWidget(self.table_layers)
         layer_buttons = QHBoxLayout()
         for label, callback in (
@@ -802,7 +803,12 @@ class MainWindow(QMainWindow):
 
     def add_structure_layer(self, material="hBN", thickness=10.0, in_reference=True,
                             fit=False, minimum=0.0, maximum=100.0, row=None):
-        row = self.table_layers.rowCount() if row is None else row
+        if row is None:
+            row = self.table_layers.rowCount()
+            if row:
+                last_material, last_thickness, *_ = self._layer_row_data(row - 1)
+                if last_material in SUBSTRATE_MATERIALS and abs(last_thickness) <= 1e-12:
+                    row -= 1
         self.table_layers.insertRow(row)
         material_box = QComboBox()
         material_box.addItems(LAYER_MATERIALS)
@@ -844,25 +850,36 @@ class MainWindow(QMainWindow):
             (self._layer_row_data(row) for row in range(self.table_layers.rowCount()))
         ]
 
+    def get_substrate_type(self):
+        return substrate_type_from_config({
+            "substrate_type": self.combo_sub.currentText(),
+            "layers": self.get_structure_layers(),
+        })
+
     def apply_structure_preset(self):
         presets = {
             0: [("Sample", 0.65, False, False, 0.1, 2.0),
-                ("SiO2", 285.0, True, True, 265.0, 305.0)],
-            1: [("hBN", 10.0, False, True, 0.0, 100.0),
+                ("SiO2", 285.0, True, True, 265.0, 305.0),
+                ("Si", 0.0, True, False, 0.0, 0.0001)],
+            1: [("Sample", 0.65, False, False, 0.1, 2.0),
+                ("Quartz", 0.0, True, False, 0.0, 0.0001)],
+            2: [("hBN", 10.0, True, True, 0.0, 100.0),
                 ("Sample", 0.65, False, False, 0.1, 2.0),
-                ("hBN", 10.0, False, True, 0.0, 100.0),
-                ("SiO2", 285.0, True, True, 265.0, 305.0)],
-            2: [("hBN", 10.0, False, True, 0.0, 100.0),
-                ("Graphene", 0.335, False, False, 0.1, 2.0),
+                ("hBN", 10.0, True, True, 0.0, 100.0),
+                ("SiO2", 285.0, True, True, 265.0, 305.0),
+                ("Si", 0.0, True, False, 0.0, 0.0001)],
+            3: [("hBN", 10.0, True, True, 0.0, 100.0),
+                ("Graphene", 0.335, True, False, 0.1, 2.0),
                 ("Sample", 0.65, False, False, 0.1, 2.0),
-                ("Graphene", 0.335, False, False, 0.1, 2.0),
-                ("hBN", 10.0, False, True, 0.0, 100.0),
-                ("SiO2", 285.0, True, True, 265.0, 305.0)],
+                ("Graphene", 0.335, True, False, 0.1, 2.0),
+                ("hBN", 10.0, True, True, 0.0, 100.0),
+                ("SiO2", 285.0, True, True, 265.0, 305.0),
+                ("Si", 0.0, True, False, 0.0, 0.0001)],
         }
-        self.combo_sub.setCurrentText("Si")
         self.table_layers.setRowCount(0)
         for row in presets[self.combo_structure_preset.currentIndex()]:
             self.add_structure_layer(*row)
+        self.combo_sub.setCurrentText(self.get_substrate_type())
         self.on_model_configuration_changed()
 
     def remove_structure_layer(self):
@@ -1148,7 +1165,7 @@ class MainWindow(QMainWindow):
         self.canvas.axes.axvline(min_e, color='g', linestyle='--', alpha=0.5, label='Min E')
         self.canvas.axes.axvline(max_e, color='g', linestyle='--', alpha=0.5, label='Max E')
         
-        self.canvas.axes.set_title(f"Contrast Spectrum (Preview)\nSubstrate={self.combo_sub.currentText()}")
+        self.canvas.axes.set_title(f"Contrast Spectrum (Preview)\nSubstrate={self.get_substrate_type()}")
         self.canvas.axes.set_xlabel("Energy (eV)")
         self.canvas.axes.set_ylabel("Contrast")
         self.canvas.axes.legend()
@@ -1243,7 +1260,7 @@ class MainWindow(QMainWindow):
                 fit_method = '2nd Derivative'
             
             struct_config = {
-                'substrate_type': self.combo_sub.currentText(),
+                'substrate_type': self.get_substrate_type(),
                 'temp': self.spin_temp.value(),
                 'numerical_aperture': self.spin_na.value(),
                 'layers': self.get_structure_layers(),
@@ -1418,7 +1435,7 @@ class MainWindow(QMainWindow):
         # Plot vs Energy
         self.canvas.axes.plot(x_ev, y_data, 'o', markersize=3, label='Experiment', alpha=0.5)
         self.canvas.axes.plot(x_ev, y_fit, 'r-', linewidth=2, label='Fit Model')
-        self.canvas.axes.set_title(f"Contrast Fit ({self.combo_sub.currentText()})")
+        self.canvas.axes.set_title(f"Contrast Fit ({self.get_substrate_type()})")
         self.canvas.axes.set_xlabel("Energy (eV)")
         self.canvas.axes.set_ylabel("Contrast")
         self.canvas.axes.legend()

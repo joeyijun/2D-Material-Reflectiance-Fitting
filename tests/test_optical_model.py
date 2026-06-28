@@ -10,9 +10,11 @@ from optical_model import (
     config_with_layer_thicknesses,
     dielectric_func_lorentz,
     dielectric_func_voigt,
+    forward_normal_wavevector,
     layer_fit_parameters,
     normalized_layer_stack,
     spectral_derivative,
+    substrate_type_from_config,
 )
 
 
@@ -37,6 +39,11 @@ class ConstantMaterials:
 
     def get_tio2_n(self, wavelength_nm):
         return np.full_like(wavelength_nm, 2.5, dtype=complex)
+
+
+class AirLikeMaterials(ConstantMaterials):
+    def get_si_n_with_temp(self, wavelength_nm, temperature_k):
+        return np.ones_like(wavelength_nm, dtype=complex)
 
 
 class OpticalModelTests(unittest.TestCase):
@@ -91,6 +98,44 @@ class OpticalModelTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(finite_na)))
         self.assertGreater(np.max(np.abs(finite_na - normal)), 1e-4)
 
+    def test_forward_wavevector_branch_decays_in_absorbing_media(self):
+        wavevector = forward_normal_wavevector(np.array([-2.0 + 0.1j]), 0.4)
+        self.assertGreaterEqual(float(np.imag(wavevector[0])), 0.0)
+        lossless = forward_normal_wavevector(np.array([-1.7 + 0.0j]), 0.2)
+        self.assertGreaterEqual(float(np.real(lossless[0])), 0.0)
+
+    def test_high_na_absorbing_layers_remain_finite(self):
+        epsilon = dielectric_func_lorentz(
+            HC_EV_NM / self.wavelengths, [8.0, 0.5, 2.0, 0.08]
+        )
+        config = {
+            "substrate_type": "Si",
+            "numerical_aperture": 0.75,
+            "layers": [
+                {"material": "Graphene", "thickness_nm": 0.335, "in_reference": True,
+                 "fit": False, "min_nm": 0.1, "max_nm": 2.0},
+                {"material": "Sample", "thickness_nm": 0.65, "in_reference": False,
+                 "fit": False, "min_nm": 0.1, "max_nm": 2.0},
+                {"material": "SiO2", "thickness_nm": 285.0, "in_reference": True,
+                 "fit": False, "min_nm": 260.0, "max_nm": 310.0},
+                {"material": "Si", "thickness_nm": 0.0, "in_reference": True,
+                 "fit": False, "min_nm": 0.0, "max_nm": 0.0001},
+            ],
+        }
+        contrast = calculate_contrast_dynamic(
+            self.wavelengths, epsilon, self.materials, config
+        )
+        self.assertTrue(np.all(np.isfinite(contrast)))
+
+    def test_relative_contrast_rejects_zero_reference_reflectance(self):
+        with self.assertRaisesRegex(ValueError, "Reference reflectance"):
+            calculate_contrast_dynamic(
+                self.wavelengths,
+                np.ones_like(self.wavelengths, dtype=complex),
+                AirLikeMaterials(),
+                {**self.config, "sample_thick": 0.0, "substrate_type": "Si"},
+            )
+
     def test_hbn_reference_stack_changes_encapsulated_contrast(self):
         epsilon = dielectric_func_lorentz(
             HC_EV_NM / self.wavelengths, [12.0, 0.5, 2.0, 0.04]
@@ -143,6 +188,22 @@ class OpticalModelTests(unittest.TestCase):
         self.assertEqual(
             [row["thickness_nm"] for row in normalized_layer_stack(updated) if row["fit"]],
             [9.0, 16.0, 286.0],
+        )
+
+    def test_final_zero_thickness_row_sets_substrate_material(self):
+        config = {
+            "substrate_type": "Si",
+            "layers": [
+                {"material": "Sample", "thickness_nm": 0.65, "in_reference": False,
+                 "fit": False, "min_nm": 0.1, "max_nm": 2.0},
+                {"material": "Quartz", "thickness_nm": 0.0, "in_reference": True,
+                 "fit": False, "min_nm": 0.0, "max_nm": 0.0001},
+            ],
+        }
+        self.assertEqual(substrate_type_from_config(config), "Quartz")
+        self.assertEqual(
+            [row["material"] for row in normalized_layer_stack(config)],
+            ["Sample"],
         )
 
     def test_layer_table_requires_exactly_one_sample(self):

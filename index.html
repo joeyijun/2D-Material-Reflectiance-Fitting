@@ -22,6 +22,7 @@ from materials import read_si_optical_constants
 from optical_model import (
     HC_EV_NM,
     LAYER_MATERIALS,
+    SUBSTRATE_MATERIALS,
     calculate_contrast_dynamic as calculate_contrast_core,
     config_with_layer_thicknesses,
     dielectric_func_lorentz as dielectric_func_lorentz_core,
@@ -29,6 +30,7 @@ from optical_model import (
     layer_fit_parameters,
     normalized_layer_stack,
     spectral_derivative,
+    substrate_type_from_config,
 )
 from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.signal import find_peaks
@@ -369,20 +371,27 @@ layer_presets = {
     "Sample / SiO2 / Si": [
         ["Sample", 0.65, False, False, 0.1, 2.0],
         ["SiO2", 285.0, True, True, 265.0, 305.0],
+        ["Si", 0.0, True, False, 0.0, 0.0001],
+    ],
+    "Sample / Quartz": [
+        ["Sample", 0.65, False, False, 0.1, 2.0],
+        ["Quartz", 0.0, True, False, 0.0, 0.0001],
     ],
     "hBN / Sample / hBN / SiO2 / Si": [
-        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
         ["Sample", 0.65, False, False, 0.1, 2.0],
-        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
         ["SiO2", 285.0, True, True, 265.0, 305.0],
+        ["Si", 0.0, True, False, 0.0, 0.0001],
     ],
     "hBN / Graphene / Sample / Graphene / hBN / SiO2 / Si": [
-        ["hBN", 10.0, False, True, 0.0, 100.0],
-        ["Graphene", 0.335, False, False, 0.1, 2.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
+        ["Graphene", 0.335, True, False, 0.1, 2.0],
         ["Sample", 0.65, False, False, 0.1, 2.0],
-        ["Graphene", 0.335, False, False, 0.1, 2.0],
-        ["hBN", 10.0, False, True, 0.0, 100.0],
+        ["Graphene", 0.335, True, False, 0.1, 2.0],
+        ["hBN", 10.0, True, True, 0.0, 100.0],
         ["SiO2", 285.0, True, True, 265.0, 305.0],
+        ["Si", 0.0, True, False, 0.0, 0.0001],
     ],
 }
 layer_columns = ["Order", "Material", "Thickness (nm)", "In reference", "Fit", "Min (nm)", "Max (nm)"]
@@ -437,7 +446,9 @@ with structure_col:
 
 with optics_col:
     st.markdown("**Optical model**")
-    sub_type = st.selectbox("Semi-infinite substrate", ["Si", "Quartz", "Sapphire", "TiO2"])
+    st.caption(
+        "Set the semi-infinite substrate as the final zero-thickness row in the layer table."
+    )
     line_shape = st.selectbox(
         "Exciton line shape", ["Voigt / Faddeeva (Recommended)", "Lorentz"]
     )
@@ -453,6 +464,7 @@ layers = [
      "min_nm": row["Min (nm)"], "max_nm": row["Max (nm)"]}
     for _, row in layer_df.sort_values("Order").iterrows()
 ]
+sub_type = substrate_type_from_config({'substrate_type': 'Si', 'layers': layers})
 config = {
     'substrate_type': sub_type, 'temp': temperature, 'layers': layers,
     'numerical_aperture': numerical_aperture, 'contrast_definition': 'relative'
@@ -1226,7 +1238,10 @@ from scipy.special import wofz
 
 
 HC_EV_NM = 1239.8419843320026
-LAYER_MATERIALS = ("Sample", "hBN", "Graphene", "SiO2", "Quartz", "Sapphire", "TiO2")
+SUBSTRATE_MATERIALS = ("Si", "Quartz", "Sapphire", "TiO2")
+LAYER_MATERIALS = (
+    "Sample", "hBN", "Graphene", "SiO2", "Si", "Quartz", "Sapphire", "TiO2"
+)
 
 
 def default_layer_stack(substrate_type="Si/SiO2"):
@@ -1239,15 +1254,55 @@ def default_layer_stack(substrate_type="Si/SiO2"):
     return layers
 
 
+def _is_substrate_row(material, thickness, index, row_count):
+    """A final zero-thickness substrate row represents the semi-infinite medium."""
+    return (
+        index == row_count - 1
+        and material in SUBSTRATE_MATERIALS
+        and abs(float(thickness)) <= 1e-12
+    )
+
+
+def substrate_type_from_config(config):
+    """Read the semi-infinite substrate from the final table row when present."""
+    rows = list(config.get("layers", []))
+    for index, row in enumerate(rows):
+        material = str(row.get("material", "")).strip()
+        thickness = float(row.get("thickness_nm", 0.0))
+        if _is_substrate_row(material, thickness, index, len(rows)):
+            return material
+    return config.get("substrate_type", "Si")
+
+
+def forward_normal_wavevector(refractive_index, sine_squared):
+    """Return the forward-propagating normal wavevector component.
+
+    Complex square roots have two branches. For absorbing media the forward
+    branch has non-negative imaginary part so fields decay with depth; for
+    lossless media the branch has non-negative real part.
+    """
+    wavevector = np.sqrt(np.asarray(refractive_index, dtype=complex) ** 2 - sine_squared + 0j)
+    tolerance = 100.0 * np.finfo(float).eps
+    flip = (np.imag(wavevector) < -tolerance) | (
+        (np.abs(np.imag(wavevector)) <= tolerance) & (np.real(wavevector) < 0)
+    )
+    return np.where(flip, -wavevector, wavevector)
+
+
 def normalized_layer_stack(config):
     """Validate a layer table, or translate the legacy fixed-layer config."""
     if "layers" in config:
         layers = []
-        for row in config["layers"]:
+        rows = list(config["layers"])
+        for index, row in enumerate(rows):
             material = str(row.get("material", "")).strip()
             if material not in LAYER_MATERIALS:
                 raise ValueError(f"Unsupported layer material: {material}")
             thickness = float(row.get("thickness_nm", 0.0))
+            if _is_substrate_row(material, thickness, index, len(rows)):
+                continue
+            if material == "Si":
+                raise ValueError("Si can only be used as the final zero-thickness substrate row")
             lower = float(row.get("min_nm", 0.0))
             upper = float(row.get("max_nm", max(thickness, 1.0)))
             if not np.isfinite(thickness) or thickness < 0:
@@ -1378,7 +1433,7 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
     n_2d = np.sqrt(eps_sample)
     # Select the passive square-root branch for the exp(-i*omega*t) convention.
     n_2d = np.where(np.imag(n_2d) < 0, -n_2d, n_2d)
-    substrate_type = config.get("substrate_type", "Si/SiO2")
+    substrate_type = substrate_type_from_config(config)
 
     if substrate_type in ("Si/SiO2", "Si"):
         n_substrate = mat_loader.get_si_n_with_temp(
@@ -1424,10 +1479,7 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
         layers = layer_stack(reference)
         matrix = np.broadcast_to(np.eye(2, dtype=complex), (wavelengths_nm.size, 2, 2)).copy()
         for index, thickness_nm in layers:
-            normal_wavevector = np.sqrt(index**2 - sine_squared + 0j)
-            normal_wavevector = np.where(
-                np.imag(normal_wavevector) < 0, -normal_wavevector, normal_wavevector
-            )
+            normal_wavevector = forward_normal_wavevector(index, sine_squared)
             admittance = (
                 normal_wavevector
                 if polarization == "s"
@@ -1443,16 +1495,13 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
             layer_matrix[:, 1, 1] = cos_phase
             matrix = matrix @ layer_matrix
 
-        substrate_wavevector = np.sqrt(n_substrate**2 - sine_squared + 0j)
-        substrate_wavevector = np.where(
-            np.imag(substrate_wavevector) < 0, -substrate_wavevector, substrate_wavevector
-        )
+        substrate_wavevector = forward_normal_wavevector(n_substrate, sine_squared)
         substrate_admittance = (
             substrate_wavevector
             if polarization == "s"
             else n_substrate**2 / substrate_wavevector
         )
-        incident_wavevector = np.sqrt(1.0 - sine_squared + 0j)
+        incident_wavevector = forward_normal_wavevector(1.0, sine_squared)
         incident_admittance = (
             incident_wavevector
             if polarization == "s"
@@ -1463,7 +1512,12 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
             matrix[:, 1, 0] + matrix[:, 1, 1] * substrate_admittance
         ) / denominator
         amplitude = (incident_admittance - admittance) / (incident_admittance + admittance)
-        return np.abs(amplitude) ** 2
+        reflectance_value = np.abs(amplitude) ** 2
+        if np.any(~np.isfinite(reflectance_value)):
+            raise ValueError("TMM reflectance calculation produced non-finite values")
+        if np.any(reflectance_value < -1e-12):
+            raise ValueError("TMM reflectance calculation produced negative values")
+        return np.maximum(reflectance_value, 0.0)
 
     def reflectance(reference):
         numerical_aperture = float(config.get("numerical_aperture", 0.0))
@@ -1486,6 +1540,8 @@ def calculate_contrast_dynamic(wavelengths_nm, eps_sample, mat_loader, config):
 
     sample_reflectance = reflectance(reference=False)
     reference_reflectance = reflectance(reference=True)
+    if np.any(reference_reflectance <= np.finfo(float).eps):
+        raise ValueError("Reference reflectance is too close to zero for relative contrast")
     definition = config.get("contrast_definition", "relative")
     if definition == "symmetric":
         denominator = sample_reflectance + reference_reflectance

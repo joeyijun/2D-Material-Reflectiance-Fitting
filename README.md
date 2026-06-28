@@ -33,6 +33,7 @@
     *   2D Material: 单层或少层样品。
 *   **高级光学默认值**: 温度、有限 NA、Si 光学数据源和背景介电常数保留为代码级参数，界面使用稳定默认值。
 *   **受控材料插值**: Si 光学常数在 400--1305 nm 内使用保形 PCHIP，区间外使用端点切线线性延拓并保持被动性。
+*   **稳健 TMM 底层**: 复折射率和斜入射下统一选择 forward branch，保证吸收介质中场随深度衰减；反射率会执行有限性、非负性和 reference 反射强度检查，避免静默输出非物理结果。
 *   **复 Voigt 介电函数（推荐）**: 使用 Faddeeva 函数分别拟合 Lorentz 均匀展宽 $w_L$ 和 Gaussian 非均匀展宽 $w_G$；经典 Lorentz 模型仍可选择。
     
   $$
@@ -45,7 +46,7 @@
     *   **Global + Robust LM**: 先进行差分进化全局初始化，再执行 Robust TRF + LM，适用于初值不确定或多峰耦合情况。
     *   **Derivative + LM**: 先用原始谱预热，再联合拟合原始谱与 Savitzky-Golay 平滑的 $dC/dE$ 或 $d^2C/dE^2$，避免噪声主导。
 *   **结构参数联合拟合**: 可联合拟合 SiO2 以及已启用的上/下 hBN 厚度。
-*   **任意层堆栈表**: 按入射侧到基底侧逐行设置 `Sample`、hBN、Graphene、SiO2、Quartz、Sapphire 或 TiO2。每层可独立设置厚度、参考区域、是否拟合及拟合上下界，并提供常见封装结构预设。
+*   **任意层堆栈表**: 按入射侧到基底侧逐行设置 `Sample`、hBN、Graphene、SiO2，以及最后一行零厚度 `Si/Quartz/Sapphire/TiO2` 半无限衬底。有限厚度层可独立设置厚度、参考区域、是否拟合及拟合上下界。
 *   **拟合控制**: 界面保留优化预算和分阶段进度；E0 搜索半宽及背景阶数使用代码默认值。
 *   **弱峰保护**: 每个初始共振区域按自身去趋势幅度平衡残差，并报告逐峰局部 $R^2$ 和振幅恢复率，避免高全谱 GOF 掩盖弱峰漏拟合。
 *   **引导式操作**: 界面按数据、层结构、拟合设置、共振和结果分步组织；无效操作自动禁用，修改模型或共振后旧拟合自动失效。
@@ -113,12 +114,12 @@ $$
 3. 点击 **Apply**，用预设替换当前层表。
 4. 在层表中逐行编辑：
    - **Order**：从入射侧到衬底侧的顺序。
-   - **Material**：选择 `Sample`、`hBN`、`Graphene`、`SiO2`、`Quartz`、`Sapphire` 或 `TiO2`。
+   - **Material**：选择 `Sample`、`hBN`、`Graphene`、`SiO2`、`Si`、`Quartz`、`Sapphire` 或 `TiO2`。
    - **Thickness (nm)**：该层厚度。
    - **In reference**：勾选表示参考区域也包含该层；`Sample` 会自动不计入参考区域。
    - **Fit**：勾选表示拟合该层厚度。
    - **Min (nm)** / **Max (nm)**：厚度拟合上下界。
-5. 在 **Semi-infinite substrate** 中选择半无限衬底：`Si`、`Quartz`、`Sapphire` 或 `TiO2`。
+5. 表格最后一行是半无限衬底行。把最后一行 **Material** 设为 `Si`、`Quartz`、`Sapphire` 或 `TiO2`，并保持 **Thickness (nm)** 为 `0`。这行只定义出射衬底，不作为有限厚度薄膜参与拟合。
 6. 在 **Exciton line shape** 中选择模型：
    - **Voigt / Faddeeva (Recommended)**：推荐，分别拟合均匀展宽 `wL` 和非均匀展宽 `wG`。
    - **Lorentz**：更简单，只使用一个 Lorentz 线宽。
@@ -198,15 +199,15 @@ $$
 3. 状态栏显示数据已就绪后，点击 **Plot Data Preview** 预览计算出的相对对比度。
 
 #### 3. 设置层结构
-1. 在 **2. Layer Stack (incident side -> substrate)** 中选择 **Substrate**。
-2. 选择 **Structure Preset**，点击 **Apply Preset**。
+1. 在 **2. Layer Stack (incident side -> substrate)** 中选择 **Structure Preset**，点击 **Apply Preset**。
+2. 预设会把半无限衬底放在层表最后一行，例如 `Si` 或 `Quartz`，厚度为 `0 nm`。
 3. 在层表中编辑：
    - **Material**：层材料。
    - **Thickness**：厚度 nm。
    - **Ref**：参考区域是否包含该层。
    - **Fit**：是否拟合该层厚度。
    - **Min/Max**：厚度拟合上下界。
-4. 使用 **Add Layer**、**Remove**、**Move Up**、**Move Down** 组合任意层结构。层顺序同样是从入射侧到衬底侧。
+4. 使用 **Add Layer**、**Remove**、**Move Up**、**Move Down** 组合任意层结构。层顺序同样是从入射侧到衬底侧；最后一行零厚度 `Si/Quartz/Sapphire/TiO2` 表示半无限衬底。
 
 #### 4. 设置拟合选项
 1. 在 **3. Fit Setup** 中设置 ROI Min / ROI Max。
@@ -283,6 +284,7 @@ The tool offers two modes of operation:
     *   2D Material: Monolayer or few-layer samples.
 *   **Advanced Optical Defaults**: temperature, finite NA, Si optical source, and background epsilon remain code-level parameters while the UI uses stable defaults.
 *   **Controlled Interpolation**: Si uses shape-preserving PCHIP in 400--1305 nm and passive endpoint-tangent linear extrapolation outside that range.
+*   **Robust TMM Core**: complex-index and oblique-incidence calculations use a forward-branch normal wavevector so fields decay in absorbing media; reflectance outputs are checked for finite, non-negative values and usable reference intensity.
 *   **Complex Voigt Dielectric Function (recommended)**: Faddeeva oscillators separate Lorentzian homogeneous width $w_L$ from Gaussian inhomogeneous width $w_G$; the classical Lorentz model remains available. Oscillator inputs are constrained to passive, physical values (`f >= 0`, `E_0 > 0`, positive linewidths).
   
   $$  
@@ -295,7 +297,7 @@ The tool offers two modes of operation:
     *   **Global + Robust LM**: Differential Evolution initialization followed by robust TRF and LM.
     *   **Derivative + LM**: warm-starts on the original spectrum, then jointly fits the spectrum and smoothed first or second energy derivative.
 *   **Joint Structure Fit**: optionally fits SiO2 and enabled top/bottom hBN thicknesses.
-*   **Arbitrary Layer Table**: order Sample, hBN, Graphene, SiO2, Quartz, Sapphire, and TiO2 layers from the incident side to the substrate. Each row controls thickness, reference-region inclusion, fit state, and bounds.
+*   **Arbitrary Layer Table**: order Sample, hBN, Graphene, SiO2, and the final zero-thickness Si/Quartz/Sapphire/TiO2 substrate row from the incident side to the substrate. Each finite-layer row controls thickness, reference-region inclusion, fit state, and bounds.
 *   **Fit Controls**: the UI exposes the optimization budget and staged progress; E0 search width and baseline order use code defaults.
 *   **Weak-feature preservation**: resonance neighborhoods are balanced by their own detrended amplitudes and receive per-peak local $R^2$ and amplitude-recovery diagnostics.
 *   **Guided workflow**: data, layer stack, fit setup, resonances, and results are organized as explicit steps; unavailable actions are disabled and stale fits are invalidated automatically.
@@ -364,12 +366,12 @@ Use this workflow for Streamlit Cloud or the local `index.html` web interface.
 3. Click **Apply** to replace the current layer table with the preset.
 4. Edit the layer table row by row:
    - **Order**: incident side to substrate side.
-   - **Material**: choose `Sample`, `hBN`, `Graphene`, `SiO2`, `Quartz`, `Sapphire`, or `TiO2`.
+   - **Material**: choose `Sample`, `hBN`, `Graphene`, `SiO2`, `Si`, `Quartz`, `Sapphire`, or `TiO2`.
    - **Thickness (nm)**: physical layer thickness.
    - **In reference**: checked means this layer is also present in the reference-region stack.
    - **Fit**: checked means this thickness is fitted.
    - **Min (nm)** and **Max (nm)**: bounds for fitted layer thickness.
-5. In **Optical model**, choose **Semi-infinite substrate** (`Si`, `Quartz`, `Sapphire`, or `TiO2`).
+5. The last table row defines the semi-infinite substrate. Set the final row **Material** to `Si`, `Quartz`, `Sapphire`, or `TiO2`, and keep **Thickness (nm)** at `0`. This row is used as the exit medium, not as a finite fitted film.
 6. Choose **Exciton line shape**:
    - **Voigt / Faddeeva (Recommended)** separates homogeneous `wL` and inhomogeneous `wG` broadening.
    - **Lorentz** uses one homogeneous linewidth.
@@ -447,16 +449,16 @@ Use this workflow for `gui_app.py`.
 4. Click **Plot Data Preview** in **5. Run & Export** to inspect the computed relative contrast.
 
 #### 3. Configure the Layer Stack
-1. In **2. Layer Stack (incident side -> substrate)**, choose **Substrate**.
-2. If needed, choose a Si data source from the hidden/advanced Si-source control; default settings are recommended for normal use.
-3. Choose a **Structure Preset** and click **Apply Preset**.
+1. In **2. Layer Stack (incident side -> substrate)**, choose a **Structure Preset** and click **Apply Preset**.
+2. The preset adds the semi-infinite substrate as the final zero-thickness row, for example `Si` or `Quartz`.
+3. The Si data source remains a hidden/advanced control; default settings are recommended for normal use.
 4. Edit the layer table:
    - **Material**: select the layer material.
    - **Thickness**: enter thickness in nm.
    - **Ref**: include this layer in the reference stack.
    - **Fit**: fit this layer thickness.
    - **Min/Max**: bounds for thickness fitting.
-5. Use **Add Layer**, **Remove**, **Move Up**, and **Move Down** to build arbitrary stacks. The row order is incident side to substrate.
+5. Use **Add Layer**, **Remove**, **Move Up**, and **Move Down** to build arbitrary stacks. The row order is incident side to substrate; the final zero-thickness `Si/Quartz/Sapphire/TiO2` row is the semi-infinite substrate.
 
 #### 4. Configure Fit Setup
 1. In **3. Fit Setup**, set **ROI Min** and **ROI Max** in eV.

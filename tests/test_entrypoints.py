@@ -91,17 +91,23 @@ class EntrypointTests(unittest.TestCase):
         self.assertFalse(window.btn_export_data.isEnabled())
         sources = [window.combo_si_data.itemText(i) for i in range(window.combo_si_data.count())]
         self.assertEqual(sources, ["Si_data.csv", "Schinke.csv", "Green-2008.csv"])
-        self.assertEqual(window.table_layers.rowCount(), 2)
+        self.assertEqual(window.table_layers.rowCount(), 3)
         self.assertEqual(
             [row["material"] for row in window.get_structure_layers()],
-            ["Sample", "SiO2"],
+            ["Sample", "SiO2", "Si"],
         )
-        window.combo_structure_preset.setCurrentIndex(2)
+        self.assertEqual(window.get_substrate_type(), "Si")
+        window.combo_structure_preset.setCurrentIndex(3)
         window.apply_structure_preset()
         self.assertEqual(
             [row["material"] for row in window.get_structure_layers()],
-            ["hBN", "Graphene", "Sample", "Graphene", "hBN", "SiO2"],
+            ["hBN", "Graphene", "Sample", "Graphene", "hBN", "SiO2", "Si"],
         )
+        self.assertEqual(
+            [row["in_reference"] for row in window.get_structure_layers()],
+            [True, True, False, True, True, True, True],
+        )
+        self.assertEqual(window.get_substrate_type(), "Si")
         add_layer = next(
             button for button in window.findChildren(module.QPushButton)
             if button.text() == "Add Layer"
@@ -110,9 +116,10 @@ class EntrypointTests(unittest.TestCase):
         add_layer.click()
         app.processEvents()
         self.assertEqual(window.table_layers.rowCount(), row_count + 1)
-        self.assertEqual(window.get_structure_layers()[-1]["material"], "hBN")
+        self.assertEqual(window.get_structure_layers()[-2]["material"], "hBN")
+        self.assertEqual(window.get_structure_layers()[-1]["material"], "Si")
         for advanced_widget in (
-            window.combo_si_data, window.spin_na, window.spin_temp,
+            window.combo_sub, window.combo_si_data, window.spin_na, window.spin_temp,
             window.spin_eps_inf, window.spin_e0_margin, window.spin_baseline_order,
         ):
             self.assertFalse(advanced_widget.isVisible())
